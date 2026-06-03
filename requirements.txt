@@ -1,0 +1,6 @@
+pandas
+numpy
+requests
+pybaseball
+gspread
+google-auth
