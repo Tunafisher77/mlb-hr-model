@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V4 - ROI Dashboard"
+MODEL_VERSION = "Automated V5 - Header Fix + ROI Cleanup"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -471,6 +471,17 @@ def add_odds_to_model(model):
     return model
 
 
+
+def ensure_header(ws, headers):
+    """
+    Makes sure row 1 has the full current header set.
+    This fixes missing headers caused by older model versions that had fewer columns.
+    It does not delete data.
+    """
+    existing = ws.row_values(1)
+    if existing != headers:
+        ws.update(values=[headers], range_name=f"A1:{chr(64 + min(len(headers), 26))}1" if len(headers) <= 26 else "A1:AZ1")
+
 def american_profit_on_1_unit(odds):
     try:
         odds = float(odds)
@@ -622,6 +633,102 @@ def refresh_roi_dashboard(sh):
     roi_ws.update(values=rows, range_name=f"A1:H{len(rows)}")
     print("ROI Dashboard updated")
 
+
+def result_to_win_loss(value):
+    res = str(value).strip().upper()
+    if res in ["1", "Y", "YES", "WIN", "W", "HR"]:
+        return "WIN"
+    if res in ["0", "N", "NO", "LOSS", "LOSE", "L"]:
+        return "LOSS"
+    return ""
+
+def fetch_player_hr_result_for_date(player_name, game_date):
+    """
+    First pass auto-grader.
+    Uses MLB Stats API schedule + boxscore for completed games.
+    Returns:
+      1 if player homered,
+      0 if player played/no HR and game is final,
+      "" if game/date cannot be graded yet.
+    """
+    try:
+        sched = requests.get(
+            "https://statsapi.mlb.com/api/v1/schedule",
+            params={"sportId":1, "date":game_date},
+            timeout=20
+        ).json()
+        games = []
+        for d in sched.get("dates", []):
+            games.extend(d.get("games", []))
+        if not games:
+            return ""
+
+        target = normalize_name_for_odds(player_name)
+
+        for g in games:
+            status = g.get("status", {}).get("detailedState", "")
+            if status not in ["Final", "Game Over", "Completed Early"]:
+                continue
+            game_pk = g.get("gamePk")
+            if not game_pk:
+                continue
+            box = requests.get(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore", timeout=20).json()
+            for side in ["home", "away"]:
+                players = box.get("teams", {}).get(side, {}).get("players", {})
+                for _, pdata in players.items():
+                    pinfo = pdata.get("person", {})
+                    pname = pinfo.get("fullName", "")
+                    if normalize_name_for_odds(pname) == target:
+                        bat = pdata.get("stats", {}).get("batting", {})
+                        hr = int(bat.get("homeRuns", 0) or 0)
+                        return 1 if hr > 0 else 0
+        return ""
+    except Exception:
+        return ""
+
+def auto_grade_daily_picks(sh):
+    """
+    Grades past Daily Picks rows where HR Result is blank and game date is before today.
+    This is intentionally conservative: it only grades completed past dates.
+    """
+    try:
+        ws = sh.worksheet("Daily Picks")
+        values = ws.get_all_values()
+        if len(values) < 2:
+            return
+        headers = values[0]
+        if "Date" not in headers or "Player" not in headers or "HR Result" not in headers:
+            return
+
+        date_i = headers.index("Date")
+        player_i = headers.index("Player")
+        result_i = headers.index("HR Result")
+        updates = []
+
+        # limit grading workload to last 150 rows to keep API usage reasonable
+        start_row = max(2, len(values) - 150 + 1)
+        for sheet_row_num in range(start_row, len(values) + 1):
+            row = values[sheet_row_num - 1]
+            if len(row) <= max(date_i, player_i, result_i):
+                continue
+            game_date = row[date_i].strip()
+            player = row[player_i].strip()
+            existing = row[result_i].strip()
+            if not game_date or not player or existing:
+                continue
+            # grade only dates before today, not today's games
+            if game_date >= TODAY.isoformat():
+                continue
+            result = fetch_player_hr_result_for_date(player, game_date)
+            if result in [0, 1]:
+                updates.append({"range": f"{chr(65 + result_i)}{sheet_row_num}", "values": [[result]]})
+
+        if updates:
+            ws.batch_update(updates)
+            print(f"Auto-graded {len(updates)} Daily Picks rows")
+    except Exception as e:
+        print(f"Auto-grading skipped: {e}")
+
 def write_to_sheet(model, matchups):
     gc = auth_google()
     try:
@@ -640,23 +747,20 @@ def write_to_sheet(model, matchups):
     for _, r in card.iterrows():
         daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("OddsBook",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("OddsStatus",""),"","","",""])
 
-    if not daily_ws.get_all_values():
-        daily_ws.append_row(daily_cols)
+    ensure_header(daily_ws, daily_cols)
     daily_ws.append_rows(clean_rows(daily_rows), value_input_option="USER_ENTERED")
 
     results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","OddsBook","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","OddsStatus","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
     results_rows = []
     for _, r in model.head(30).iterrows():
         results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("OddsBook",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("OddsStatus",""),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
-    if not results_ws.get_all_values():
-        results_ws.append_row(results_cols)
+    ensure_header(results_ws, results_cols)
     results_ws.append_rows(clean_rows(results_rows), value_input_option="USER_ENTERED")
 
     weather_cols = ["Date","Venue","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore"]
     weather_log = matchups[["Venue","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore"]].drop_duplicates().copy()
     weather_rows = [[TODAY.isoformat(), r["Venue"], r["TempF"], r["Humidity"], r["WindMPH"], r["WindFromDir"], r["WindBlowingTo"], r["WindAngleToCF"], r["WindImpact"], r["WindBoost"], str(r["Dome"]), r["WeatherScore"]] for _, r in weather_log.iterrows()]
-    if not weather_ws.get_all_values():
-        weather_ws.append_row(weather_cols)
+    ensure_header(weather_ws, weather_cols)
     weather_ws.append_rows(clean_rows(weather_rows), value_input_option="USER_ENTERED")
 
     summary_ws.clear()
@@ -670,10 +774,11 @@ def write_to_sheet(model, matchups):
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
         ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
         ["Vegas Odds","The Odds API batter_home_runs market; BestHROdds/OddsBook/EdgePct/ValueScore added"],
-        ["ROI Tracking","ROI Dashboard tab added; enter HR Result and actual Odds to grade bets"],
+        ["ROI Tracking","ROI Dashboard tab added; headers auto-repaired; past-game auto-grading started"],
         ["Sheet Updated","Yes"],
     ]
     summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
+    auto_grade_daily_picks(sh)
     refresh_roi_dashboard(sh)
     print(f"Updated Google Sheet: {SHEET_NAME}")
     return card
