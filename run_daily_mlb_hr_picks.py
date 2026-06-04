@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V2B - Weather + Pitcher Confidence"
+MODEL_VERSION = "Automated V3 - Weather + Pitcher + Vegas Odds"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -319,6 +319,157 @@ def build_model():
     model["Tier"] = model["Rank"].apply(tier_from_rank)
     return model, matchups
 
+
+def normalize_name_for_odds(name):
+    return "".join(ch.lower() for ch in str(name) if ch.isalnum())
+
+def american_to_implied_pct(odds):
+    try:
+        odds = float(odds)
+        if odds > 0:
+            return round(10000 / (odds + 100), 2)
+        if odds < 0:
+            return round((-odds) / ((-odds) + 100) * 100, 2)
+    except Exception:
+        pass
+    return ""
+
+def estimated_model_hr_prob(score):
+    """
+    Conservative first-pass conversion from model score to estimated HR probability.
+    This is not calibrated yet. It gives us a starting value score until we collect results.
+    """
+    try:
+        s = float(score)
+        return round(max(1.0, min(22.0, 2.0 + (s / 100.0) * 18.0)), 2)
+    except Exception:
+        return ""
+
+def fetch_hr_odds():
+    """
+    Pulls MLB batter home run odds from The Odds API.
+    Uses the event-level endpoint so we can request batter_home_runs player props.
+    Returns dict keyed by normalized player name.
+    """
+    api_key = os.environ.get("ODDS_API_KEY", "")
+    if not api_key:
+        print("ODDS_API_KEY missing. Continuing without Vegas odds.")
+        return {}, "Missing ODDS_API_KEY"
+
+    sport = "baseball_mlb"
+    base = "https://api.the-odds-api.com/v4"
+    regions = os.environ.get("ODDS_REGIONS", "us")
+    books = os.environ.get("ODDS_BOOKMAKERS", "")  # optional comma list
+    odds_map = {}
+    status = "OK"
+
+    try:
+        events_resp = requests.get(
+            f"{base}/sports/{sport}/events",
+            params={"apiKey": api_key, "dateFormat": "iso"},
+            timeout=30
+        )
+        if events_resp.status_code != 200:
+            return {}, f"Events error {events_resp.status_code}: {events_resp.text[:200]}"
+        events = events_resp.json()
+    except Exception as e:
+        return {}, f"Events exception: {e}"
+
+    # Limit to events around today to protect free credits.
+    today_prefix = TODAY.isoformat()
+    tomorrow_prefix = (TODAY + timedelta(days=1)).isoformat()
+    todays_events = []
+    for ev in events:
+        ct = str(ev.get("commence_time", ""))
+        if ct.startswith(today_prefix) or ct.startswith(tomorrow_prefix):
+            todays_events.append(ev)
+
+    for ev in todays_events:
+        params = {
+            "apiKey": api_key,
+            "regions": regions,
+            "markets": "batter_home_runs",
+            "oddsFormat": "american"
+        }
+        if books.strip():
+            params["bookmakers"] = books.strip()
+
+        try:
+            r = requests.get(f"{base}/sports/{sport}/events/{ev.get('id')}/odds", params=params, timeout=30)
+            if r.status_code != 200:
+                status = f"Some odds errors. Last {r.status_code}: {r.text[:120]}"
+                continue
+            data = r.json()
+        except Exception as e:
+            status = f"Some odds exceptions. Last: {e}"
+            continue
+
+        for bm in data.get("bookmakers", []):
+            book_title = bm.get("title", bm.get("key", ""))
+            for market in bm.get("markets", []):
+                if market.get("key") != "batter_home_runs":
+                    continue
+                for out in market.get("outcomes", []):
+                    # The Odds API commonly uses name='Over' and description='<player>' for player props.
+                    outcome_name = str(out.get("name", ""))
+                    player = out.get("description") or out.get("player") or ""
+                    if not player:
+                        # Fallback: sometimes player can be embedded in outcome name.
+                        player = outcome_name
+                    if outcome_name.lower() not in ["over", "yes"] and "over" not in outcome_name.lower():
+                        continue
+                    point = out.get("point", "")
+                    price = out.get("price", "")
+                    if price in ["", None]:
+                        continue
+                    key = normalize_name_for_odds(player)
+                    if not key:
+                        continue
+                    current = odds_map.get(key)
+                    # For positive American odds, bigger is better. For negative odds, closer to positive is better.
+                    if current is None or float(price) > float(current["BestHROdds"]):
+                        odds_map[key] = {
+                            "PlayerOddsName": player,
+                            "BestHROdds": int(float(price)),
+                            "OddsBook": book_title,
+                            "OddsPoint": point,
+                            "ImpliedProbPct": american_to_implied_pct(price),
+                        }
+
+    return odds_map, status
+
+def add_odds_to_model(model):
+    odds_map, odds_status = fetch_hr_odds()
+    rows = []
+    for _, r in model.iterrows():
+        key = normalize_name_for_odds(r.get("Player", ""))
+        od = odds_map.get(key, {})
+        best = od.get("BestHROdds", "")
+        implied = od.get("ImpliedProbPct", "")
+        model_prob = estimated_model_hr_prob(r.get("Score", 0))
+        if implied != "" and model_prob != "":
+            edge = round(float(model_prob) - float(implied), 2)
+        else:
+            edge = ""
+        value_score = float(r.get("Score", 0))
+        if edge != "":
+            value_score = value_score + max(0, edge) * 1.5
+        rows.append({
+            "Player": r.get("Player", ""),
+            "PlayerOddsName": od.get("PlayerOddsName", ""),
+            "BestHROdds": best,
+            "OddsBook": od.get("OddsBook", ""),
+            "OddsPoint": od.get("OddsPoint", ""),
+            "ImpliedProbPct": implied,
+            "ModelProbEstPct": model_prob,
+            "EdgePct": edge,
+            "ValueScore": round(value_score, 2),
+            "OddsStatus": odds_status
+        })
+    odds_df = pd.DataFrame(rows)
+    model = model.merge(odds_df, on="Player", how="left")
+    return model
+
 def write_to_sheet(model, matchups):
     gc = auth_google()
     try:
@@ -332,19 +483,19 @@ def write_to_sheet(model, matchups):
     summary_ws = get_or_create_ws(sh, "Scorecard Summary", 100, 12)
 
     card = model[model["Rank"] <= 9].copy()
-    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","HR Result","Stake","Odds","ProfitLoss"]
+    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","OddsBook","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","OddsStatus","HR Result","Stake","Odds","ProfitLoss"]
     daily_rows = []
     for _, r in card.iterrows():
-        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),"","","",""])
+        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("OddsBook",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("OddsStatus",""),"","","",""])
 
     if not daily_ws.get_all_values():
         daily_ws.append_row(daily_cols)
     daily_ws.append_rows(clean_rows(daily_rows), value_input_option="USER_ENTERED")
 
-    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
+    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","OddsBook","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","OddsStatus","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
     results_rows = []
     for _, r in model.head(30).iterrows():
-        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
+        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("OddsBook",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("OddsStatus",""),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
     if not results_ws.get_all_values():
         results_ws.append_row(results_cols)
     results_ws.append_rows(clean_rows(results_rows), value_input_option="USER_ENTERED")
@@ -366,6 +517,7 @@ def write_to_sheet(model, matchups):
         ["Longshot Picks",len(card[card["Tier"]=="Longshot"])],
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
         ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
+        ["Vegas Odds","The Odds API batter_home_runs market; BestHROdds/OddsBook/EdgePct/ValueScore added"],
         ["ROI Tracking","Stake/Odds/ProfitLoss columns added"],
         ["Sheet Updated","Yes"],
     ]
@@ -375,13 +527,20 @@ def write_to_sheet(model, matchups):
 
 def main():
     model, matchups = build_model()
+    model = add_odds_to_model(model)
+    # Value-aware rank after odds are added. If no odds are available, ValueScore equals Score.
+    if 'ValueScore' in model.columns:
+        model = model.sort_values('ValueScore', ascending=False).reset_index(drop=True)
+        model['Rank'] = model.index + 1
+        model['Group'] = model['Rank'].apply(lambda x: 'Group 1' if x <= 10 else ('Group 2' if x <= 20 else 'Group 3'))
+        model['Tier'] = model['Rank'].apply(tier_from_rank)
     card = write_to_sheet(model, matchups)
     print("Daily HR Card")
     for tier in ["Primary","Secondary","Longshot"]:
         print("")
         print(tier)
         for _, r in card[card["Tier"] == tier].iterrows():
-            print(f"- {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} — Score {round(float(r['Score']),1)} — Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})")
+            print(f"- {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} — Score {round(float(r['Score']),1)} — Odds {r.get('BestHROdds','')} {r.get('OddsBook','')} — Edge {r.get('EdgePct','')} — Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})")
 
 if __name__ == "__main__":
     main()
