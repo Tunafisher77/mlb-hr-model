@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V11H - Consensus Odds Stabilized"
+MODEL_VERSION = "Automated Final - Stable Odds + Email Ready"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -856,3 +856,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
