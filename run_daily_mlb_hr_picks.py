@@ -357,7 +357,7 @@ def write_to_sheet(model, matchups):
     weather_ws.append_rows(clean_rows(weather_rows), value_input_option="USER_ENTERED")
 
     summary_ws.clear()
-    summary_ws.update(values=clean_rows([
+    summary_rows = [
         ["Daily MLB HR Picks Scorecard",""],
         ["Last Automated Run",datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
         ["Model Version",MODEL_VERSION],
@@ -368,7 +368,8 @@ def write_to_sheet(model, matchups):
         ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
         ["ROI Tracking","Stake/Odds/ProfitLoss columns added"],
         ["Sheet Updated","Yes"],
-    ]), range_name="A1:B9")
+    ]
+    summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
     print(f"Updated Google Sheet: {SHEET_NAME}")
     return card
 
@@ -384,3 +385,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
