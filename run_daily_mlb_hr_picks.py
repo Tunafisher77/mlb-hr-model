@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V9 - True 1+ HR Odds Filter"
+MODEL_VERSION = "Automated V11 - Consensus HR Odds"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -373,11 +373,33 @@ def estimated_model_hr_prob(score):
     except Exception:
         return ""
 
+def odds_sanity_status(best_odds, avg_odds, books_found):
+    """
+    Basic anytime HR sanity checks.
+    Normal 1+ HR props usually land roughly between +150 and +1500.
+    Longshots can be higher, but anything very high should be reviewed.
+    """
+    try:
+        b = float(best_odds)
+        a = float(avg_odds)
+    except Exception:
+        return "No true 1+ HR odds found"
+    if books_found < 2:
+        return "Low book count"
+    if b > 1800 or a > 1500:
+        return "CHECK - unusually high HR odds"
+    if b < 100 or a < 100:
+        return "CHECK - unusually low HR odds"
+    return "Consensus OK"
+
 def fetch_hr_odds():
     """
-    Pulls MLB batter home run odds from The Odds API.
-    Uses the event-level endpoint so we can request batter_home_runs player props.
-    Returns dict keyed by normalized player name.
+    V11 odds engine:
+    - Queries The Odds API batter_home_runs market
+    - Keeps only Over 0.5 / true 1+ HR style outcomes
+    - Collects all sportsbook prices per player
+    - Removes obvious outliers
+    - Returns best odds, average odds, number of books, and best book
     """
     api_key = os.environ.get("ODDS_API_KEY", "")
     if not api_key:
@@ -387,8 +409,8 @@ def fetch_hr_odds():
     sport = "baseball_mlb"
     base = "https://api.the-odds-api.com/v4"
     regions = os.environ.get("ODDS_REGIONS", "us")
-    books = os.environ.get("ODDS_BOOKMAKERS", "")  # optional comma list
-    odds_map = {}
+    books = os.environ.get("ODDS_BOOKMAKERS", "")
+    player_prices = {}
     status = "OK"
 
     try:
@@ -403,7 +425,6 @@ def fetch_hr_odds():
     except Exception as e:
         return {}, f"Events exception: {e}"
 
-    # Limit to events around today to protect free credits.
     today_prefix = TODAY.isoformat()
     tomorrow_prefix = (TODAY + timedelta(days=1)).isoformat()
     todays_events = []
@@ -423,7 +444,11 @@ def fetch_hr_odds():
             params["bookmakers"] = books.strip()
 
         try:
-            r = requests.get(f"{base}/sports/{sport}/events/{ev.get('id')}/odds", params=params, timeout=30)
+            r = requests.get(
+                f"{base}/sports/{sport}/events/{ev.get('id')}/odds",
+                params=params,
+                timeout=30
+            )
             if r.status_code != 200:
                 status = f"Some odds errors. Last {r.status_code}: {r.text[:120]}"
                 continue
@@ -437,45 +462,81 @@ def fetch_hr_odds():
             for market in bm.get("markets", []):
                 if market.get("key") != "batter_home_runs":
                     continue
+
                 for out in market.get("outcomes", []):
-                    # The Odds API commonly uses name='Over' and description='<player>' for player props.
                     outcome_name = str(out.get("name", ""))
                     player = out.get("description") or out.get("player") or ""
-                    if not player:
-                        # Fallback: sometimes player can be embedded in outcome name.
-                        player = outcome_name
-                    if outcome_name.lower() not in ["over", "yes"] and "over" not in outcome_name.lower():
-                        continue
                     point = out.get("point", "")
                     price = out.get("price", "")
-                    if price in ["", None]:
+
+                    if not player or price in ["", None]:
                         continue
 
-                    # V9 critical fix: only use Over 0.5 home runs as true "to hit 1+ HR" odds.
+                    # Accept true 1+ HR market: Over 0.5.
+                    # Reject alternate markets like Over 1.5 / 2.5.
+                    if outcome_name.lower() not in ["over", "yes"] and "over" not in outcome_name.lower():
+                        continue
                     if not is_true_one_plus_hr_market(point):
+                        continue
+
+                    try:
+                        p = int(float(price))
+                    except Exception:
+                        continue
+
+                    # Hard filter obvious bad alternate/parlay/boosted results.
+                    if p > 2500 or p < 80:
                         continue
 
                     key = normalize_name_for_odds(player)
                     if not key:
                         continue
-                    current = odds_map.get(key)
-                    clean_price, odds_note = sanitize_hr_odds(price)
 
-                    # If the price is still suspicious, do not use it as BestHROdds.
-                    if clean_price == "":
-                        continue
+                    player_prices.setdefault(key, {
+                        "PlayerOddsName": player,
+                        "Prices": []
+                    })
+                    player_prices[key]["Prices"].append({
+                        "book": book_title,
+                        "price": p,
+                        "point": point,
+                    })
 
-                    # For positive American odds, bigger is better. For negative odds, closer to positive is better.
-                    if current is None or float(clean_price) > float(current["BestHROdds"]):
-                        odds_map[key] = {
-                            "PlayerOddsName": player,
-                            "BestHROdds": clean_price,
-                            "RawHROdds": int(float(price)),
-                            "OddsBook": book_title,
-                            "OddsPoint": point,
-                            "ImpliedProbPct": american_to_implied_pct(clean_price),
-                            "OddsNote": "True 1+ HR Over 0.5",
-                        }
+    odds_map = {}
+    for key, item in player_prices.items():
+        prices = item["Prices"]
+        if not prices:
+            continue
+
+        # Remove outliers using simple median guard.
+        values = sorted([x["price"] for x in prices])
+        median = values[len(values)//2]
+        filtered = []
+        for x in prices:
+            # Keep prices within a reasonable range around median.
+            if x["price"] <= median + 600 and x["price"] >= max(80, median - 400):
+                filtered.append(x)
+
+        if not filtered:
+            filtered = prices
+
+        best = max(filtered, key=lambda x: x["price"])
+        avg = round(sum(x["price"] for x in filtered) / len(filtered))
+        books_found = len(filtered)
+
+        odds_map[key] = {
+            "PlayerOddsName": item["PlayerOddsName"],
+            "BestHROdds": int(best["price"]),
+            "AvgHROdds": int(avg),
+            "BooksFound": books_found,
+            "BestBook": best["book"],
+            "OddsBook": best["book"],
+            "OddsPoint": best["point"],
+            "RawHROdds": int(best["price"]),
+            "ImpliedProbPct": american_to_implied_pct(avg),
+            "OddsNote": odds_sanity_status(best["price"], avg, books_found),
+            "OddsStatus": status
+        }
 
     return odds_map, status
 
@@ -485,349 +546,40 @@ def add_odds_to_model(model):
     for _, r in model.iterrows():
         key = normalize_name_for_odds(r.get("Player", ""))
         od = odds_map.get(key, {})
+
         best = od.get("BestHROdds", "")
+        avg = od.get("AvgHROdds", "")
         implied = od.get("ImpliedProbPct", "")
         model_prob = estimated_model_hr_prob(r.get("Score", 0))
+
         if implied != "" and model_prob != "":
             edge = round(float(model_prob) - float(implied), 2)
         else:
             edge = ""
+
         value_score = float(r.get("Score", 0))
         if edge != "":
             value_score = value_score + max(0, edge) * 1.5
+
         rows.append({
             "Player": r.get("Player", ""),
             "PlayerOddsName": od.get("PlayerOddsName", ""),
             "BestHROdds": best,
+            "AvgHROdds": avg,
+            "BooksFound": od.get("BooksFound", ""),
+            "BestBook": od.get("BestBook", ""),
+            "RawHROdds": od.get("RawHROdds", ""),
             "OddsBook": od.get("OddsBook", ""),
             "OddsPoint": od.get("OddsPoint", ""),
-            "RawHROdds": od.get("RawHROdds", ""),
-            "OddsNote": od.get("OddsNote", ""),
+            "OddsNote": od.get("OddsNote", "No true 1+ HR odds found"),
             "ImpliedProbPct": implied,
             "ModelProbEstPct": model_prob,
             "EdgePct": edge,
             "ValueScore": round(value_score, 2),
-            "OddsStatus": odds_status
+            "OddsStatus": od.get("OddsStatus", odds_status)
         })
     odds_df = pd.DataFrame(rows)
     model = model.merge(odds_df, on="Player", how="left")
-    return model
-
-
-
-def ensure_header(ws, headers):
-    """
-    Makes sure row 1 has the full current header set.
-    This fixes missing headers caused by older model versions that had fewer columns.
-    It does not delete data.
-    """
-    existing = ws.row_values(1)
-    if existing != headers:
-        ws.update(values=[headers], range_name=f"A1:{chr(64 + min(len(headers), 26))}1" if len(headers) <= 26 else "A1:AZ1")
-
-def american_profit_on_1_unit(odds):
-    try:
-        odds = float(odds)
-        if odds > 0:
-            return odds / 100.0
-        if odds < 0:
-            return 100.0 / abs(odds)
-    except Exception:
-        pass
-    return 0.0
-
-def calculate_profit_loss(hr_result, stake, odds):
-    """
-    HR Result accepted values:
-    1, Y, YES, WIN, HR = win
-    0, N, NO, LOSS, LOSE = loss
-    blank = not graded
-    """
-    res = str(hr_result).strip().upper()
-    if res == "":
-        return ""
-    try:
-        stake = float(stake) if str(stake).strip() != "" else 1.0
-    except Exception:
-        stake = 1.0
-    try:
-        odds = float(odds)
-    except Exception:
-        return ""
-
-    if res in ["1", "Y", "YES", "WIN", "W", "HR"]:
-        return round(stake * american_profit_on_1_unit(odds), 2)
-    if res in ["0", "N", "NO", "LOSS", "LOSE", "L"]:
-        return round(-stake, 2)
-    return ""
-
-def build_roi_dashboard_rows(daily_records):
-    """
-    Builds a readable ROI Dashboard from the Daily Picks sheet.
-    Uses HR Result, Stake, and Odds columns.
-    If Stake is blank, assumes 1 unit.
-    If Odds is blank, falls back to BestHROdds when available.
-    """
-    if daily_records is None or len(daily_records) == 0:
-        return [["ROI Dashboard"], ["No Daily Picks data found"]]
-
-    df = pd.DataFrame(daily_records)
-    if df.empty:
-        return [["ROI Dashboard"], ["No Daily Picks data found"]]
-
-    # Normalize expected columns.
-    for col in ["Date","Model Version","Tier","Player","Venue","WeatherScore","HR Result","Stake","Odds","ProfitLoss","BestHROdds","ValueScore"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    # Force object/string-safe columns before mixing manual Odds and BestHROdds.
-    # This avoids pandas Arrow string assignment errors in GitHub Actions.
-    df["StakeCalc"] = pd.to_numeric(df["Stake"].astype(str).replace("", "1"), errors="coerce").fillna(1)
-    odds_manual = df["Odds"].astype(str).replace("nan", "").str.strip()
-    odds_best = df["BestHROdds"].astype(str).replace("nan", "").str.strip()
-    df["OddsCalc"] = odds_manual.where(odds_manual != "", odds_best)
-    df["OddsCalc"] = pd.to_numeric(df["OddsCalc"], errors="coerce")
-
-    # Calculate missing ProfitLoss where possible.
-    calc_pl = []
-    for _, r in df.iterrows():
-        existing = str(r.get("ProfitLoss", "")).strip()
-        if existing != "":
-            try:
-                calc_pl.append(float(existing))
-                continue
-            except Exception:
-                pass
-        calc = calculate_profit_loss(r.get("HR Result", ""), r.get("StakeCalc", 1), r.get("OddsCalc", ""))
-        calc_pl.append(calc if calc != "" else np.nan)
-    df["ProfitLossCalc"] = pd.to_numeric(pd.Series(calc_pl, dtype="object"), errors="coerce")
-
-    result_norm = df["HR Result"].astype(str).str.strip().str.upper()
-    graded = df[result_norm.isin(["1","Y","YES","WIN","W","HR","0","N","NO","LOSS","LOSE","L"])].copy()
-    if graded.empty:
-        return [
-            ["ROI Dashboard"],
-            ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-            ["Status", "No graded bets yet. Enter HR Result as 1 for HR or 0 for no HR."],
-            [],
-            ["How to use"],
-            ["1", "Enter HR Result: 1 = HR, 0 = No HR"],
-            ["2", "Enter Odds if you used actual sportsbook odds"],
-            ["3", "Stake can be blank; blank assumes 1 unit"],
-            ["4", "Dashboard updates after next automated/manual run"],
-        ]
-
-    graded["Win"] = result_norm.loc[graded.index].isin(["1","Y","YES","WIN","W","HR"]).astype(int)
-    graded["Loss"] = 1 - graded["Win"]
-    graded["UnitsRisked"] = graded["StakeCalc"]
-    graded["ProfitLossCalc"] = graded["ProfitLossCalc"].fillna(0)
-
-    def summarize(group_df):
-        bets = len(group_df)
-        wins = int(group_df["Win"].sum())
-        losses = int(group_df["Loss"].sum())
-        risked = round(float(group_df["UnitsRisked"].sum()), 2)
-        profit = round(float(group_df["ProfitLossCalc"].sum()), 2)
-        hit = round((wins / bets * 100), 2) if bets else 0
-        roi = round((profit / risked * 100), 2) if risked else 0
-        return [bets, wins, losses, hit, risked, profit, roi]
-
-    rows = []
-    rows += [["ROI Dashboard"], ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")], []]
-    rows += [["Overall Performance"], ["Bets","Wins","Losses","Hit Rate %","Units Risked","Net Profit","ROI %"]]
-    rows += [summarize(graded), []]
-
-    def add_group_section(title, col):
-        nonlocal rows
-        rows += [[title], [col,"Bets","Wins","Losses","Hit Rate %","Units Risked","Net Profit","ROI %"]]
-        for key, g in graded.groupby(col, dropna=False):
-            rows.append([key] + summarize(g))
-        rows.append([])
-
-    add_group_section("By Model Version", "Model Version")
-    add_group_section("By Tier", "Tier")
-    if "ConfidenceGrade" in graded.columns:
-        add_group_section("By Confidence Grade", "ConfidenceGrade")
-    graded["Odds Bucket"] = graded["OddsCalc"].apply(odds_bucket)
-    add_group_section("By Odds Range", "Odds Bucket")
-    add_group_section("By Venue", "Venue")
-
-    # Weather score buckets
-    graded["WeatherScoreNum"] = pd.to_numeric(graded["WeatherScore"], errors="coerce")
-    def wx_bucket(x):
-        if pd.isna(x):
-            return "Unknown"
-        if x < 50:
-            return "<50"
-        if x < 60:
-            return "50-59"
-        if x < 70:
-            return "60-69"
-        if x < 80:
-            return "70-79"
-        return "80+"
-    graded["Weather Bucket"] = graded["WeatherScoreNum"].apply(wx_bucket)
-    add_group_section("By Weather Score", "Weather Bucket")
-
-    return clean_rows(rows)
-
-def refresh_roi_dashboard(sh):
-    daily_ws = get_or_create_ws(sh, "Daily Picks", 1000, 50)
-    roi_ws = get_or_create_ws(sh, "ROI Dashboard", 300, 20)
-
-    records = daily_ws.get_all_records()
-    rows = build_roi_dashboard_rows(records)
-
-    roi_ws.clear()
-    # Use a wide enough range for mixed width rows.
-    roi_ws.update(values=rows, range_name=f"A1:H{len(rows)}")
-    print("ROI Dashboard updated")
-
-
-def result_to_win_loss(value):
-    res = str(value).strip().upper()
-    if res in ["1", "Y", "YES", "WIN", "W", "HR"]:
-        return "WIN"
-    if res in ["0", "N", "NO", "LOSS", "LOSE", "L"]:
-        return "LOSS"
-    return ""
-
-def fetch_player_hr_result_for_date(player_name, game_date):
-    """
-    First pass auto-grader.
-    Uses MLB Stats API schedule + boxscore for completed games.
-    Returns:
-      1 if player homered,
-      0 if player played/no HR and game is final,
-      "" if game/date cannot be graded yet.
-    """
-    try:
-        sched = requests.get(
-            "https://statsapi.mlb.com/api/v1/schedule",
-            params={"sportId":1, "date":game_date},
-            timeout=20
-        ).json()
-        games = []
-        for d in sched.get("dates", []):
-            games.extend(d.get("games", []))
-        if not games:
-            return ""
-
-        target = normalize_name_for_odds(player_name)
-
-        for g in games:
-            status = g.get("status", {}).get("detailedState", "")
-            if status not in ["Final", "Game Over", "Completed Early"]:
-                continue
-            game_pk = g.get("gamePk")
-            if not game_pk:
-                continue
-            box = requests.get(f"https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore", timeout=20).json()
-            for side in ["home", "away"]:
-                players = box.get("teams", {}).get(side, {}).get("players", {})
-                for _, pdata in players.items():
-                    pinfo = pdata.get("person", {})
-                    pname = pinfo.get("fullName", "")
-                    if normalize_name_for_odds(pname) == target:
-                        bat = pdata.get("stats", {}).get("batting", {})
-                        hr = int(bat.get("homeRuns", 0) or 0)
-                        return 1 if hr > 0 else 0
-        return ""
-    except Exception:
-        return ""
-
-def auto_grade_daily_picks(sh):
-    """
-    Grades past Daily Picks rows where HR Result is blank and game date is before today.
-    This is intentionally conservative: it only grades completed past dates.
-    """
-    try:
-        ws = sh.worksheet("Daily Picks")
-        values = ws.get_all_values()
-        if len(values) < 2:
-            return
-        headers = values[0]
-        if "Date" not in headers or "Player" not in headers or "HR Result" not in headers:
-            return
-
-        date_i = headers.index("Date")
-        player_i = headers.index("Player")
-        result_i = headers.index("HR Result")
-        updates = []
-
-        # limit grading workload to last 150 rows to keep API usage reasonable
-        start_row = max(2, len(values) - 150 + 1)
-        for sheet_row_num in range(start_row, len(values) + 1):
-            row = values[sheet_row_num - 1]
-            if len(row) <= max(date_i, player_i, result_i):
-                continue
-            game_date = row[date_i].strip()
-            player = row[player_i].strip()
-            existing = row[result_i].strip()
-            if not game_date or not player or existing:
-                continue
-            # grade only dates before today, not today's games
-            if game_date >= TODAY.isoformat():
-                continue
-            result = fetch_player_hr_result_for_date(player, game_date)
-            if result in [0, 1]:
-                updates.append({"range": f"{chr(65 + result_i)}{sheet_row_num}", "values": [[result]]})
-
-        if updates:
-            ws.batch_update(updates)
-            print(f"Auto-graded {len(updates)} Daily Picks rows")
-    except Exception as e:
-        print(f"Auto-grading skipped: {e}")
-
-
-
-def confidence_grade(row):
-    """
-    Simple readable grade for betting confidence.
-    A = strongest mix of value, model score, weather, and pitcher confidence.
-    B = playable
-    C = watchlist
-    D = low confidence
-    """
-    try:
-        score = float(row.get("Score", 0) or 0)
-        value = float(row.get("ValueScore", score) or score)
-        edge = float(row.get("EdgePct", 0) or 0)
-        wx = float(row.get("WeatherScore", 50) or 50)
-        pconf = str(row.get("PitcherConfidence", "")).lower()
-    except Exception:
-        return "C"
-
-    grade_points = 0
-    if value >= 85: grade_points += 2
-    elif value >= 75: grade_points += 1
-
-    if score >= 70: grade_points += 2
-    elif score >= 62: grade_points += 1
-
-    if edge >= 8: grade_points += 2
-    elif edge >= 4: grade_points += 1
-
-    if wx >= 70: grade_points += 1
-
-    if pconf == "high": grade_points += 1
-    elif pconf == "low": grade_points -= 1
-
-    if grade_points >= 6:
-        return "A"
-    if grade_points >= 4:
-        return "B"
-    if grade_points >= 2:
-        return "C"
-    return "D"
-
-def add_value_rank_and_grade(model):
-    if "ValueScore" not in model.columns:
-        model["ValueScore"] = model["Score"]
-    model["ValueScoreNum"] = pd.to_numeric(model["ValueScore"], errors="coerce").fillna(pd.to_numeric(model["Score"], errors="coerce").fillna(0))
-    model = model.sort_values("ValueScoreNum", ascending=False).reset_index(drop=True)
-    model["ValueRank"] = model.index + 1
-    model["ConfidenceGrade"] = model.apply(confidence_grade, axis=1)
     return model
 
 def build_email_summary_rows(card):
@@ -914,7 +666,7 @@ def refresh_recommended_bets(sh, card):
 
     headers = [
         "Date","Grade","ValueRank","Tier","Player","Team","Opponent","Opposing Pitcher",
-        "Venue","Score","ValueScore","BestHROdds","RawHROdds","OddsBook","EdgePct",
+        "Venue","Score","ValueScore","BestHROdds","AvgHROdds","BooksFound","BestBook","RawHROdds","OddsBook","EdgePct",
         "WeatherScore","WindImpact","PitcherConfidence","Recommendation"
     ]
     rows = [["Recommended Bets"], ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")], [], headers]
@@ -940,6 +692,9 @@ def refresh_recommended_bets(sh, card):
             round(float(r.get("Score",0)),2),
             r.get("ValueScore",""),
             r.get("BestHROdds",""),
+            r.get("AvgHROdds",""),
+            r.get("BooksFound",""),
+            r.get("BestBook",""),
             r.get("RawHROdds",""),
             r.get("OddsBook",""),
             r.get("EdgePct",""),
@@ -966,18 +721,18 @@ def write_to_sheet(model, matchups):
     summary_ws = get_or_create_ws(sh, "Scorecard Summary", 100, 12)
 
     card = model[model["Rank"] <= 9].copy()
-    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","ValueRank","ConfidenceGrade","OddsStatus","HR Result","Stake","Odds","ProfitLoss"]
+    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","AvgHROdds","BooksFound","BestBook","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","ValueRank","ConfidenceGrade","OddsStatus","HR Result","Stake","Odds","ProfitLoss"]
     daily_rows = []
     for _, r in card.iterrows():
-        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("ValueRank",""),r.get("ConfidenceGrade",""),r.get("OddsStatus",""),"","","",""])
+        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("AvgHROdds",""),r.get("BooksFound",""),r.get("BestBook",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("ValueRank",""),r.get("ConfidenceGrade",""),r.get("OddsStatus",""),"","","",""])
 
     ensure_header(daily_ws, daily_cols)
     daily_ws.append_rows(clean_rows(daily_rows), value_input_option="USER_ENTERED")
 
-    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","ValueRank","ConfidenceGrade","OddsStatus","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
+    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","AvgHROdds","BooksFound","BestBook","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","ValueRank","ConfidenceGrade","OddsStatus","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
     results_rows = []
     for _, r in model.head(30).iterrows():
-        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("ValueRank",""),r.get("ConfidenceGrade",""),r.get("OddsStatus",""),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
+        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("AvgHROdds",""),r.get("BooksFound",""),r.get("BestBook",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("ValueRank",""),r.get("ConfidenceGrade",""),r.get("OddsStatus",""),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
     ensure_header(results_ws, results_cols)
     results_ws.append_rows(clean_rows(results_rows), value_input_option="USER_ENTERED")
 
