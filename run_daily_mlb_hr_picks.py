@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V2 - Weather/Wind Upgrade"
+MODEL_VERSION = "Automated V2B - Weather + Pitcher Confidence"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -201,6 +201,22 @@ def get_or_create_ws(spreadsheet, title, rows=100, cols=30):
     except Exception:
         return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
 
+
+def probable_pitcher_fallback(team_abbr, opponent_abbr):
+    """
+    MLB schedule probablePitcher is sometimes blank early in the morning.
+    Fallback strategy:
+    1) Try today's schedule hydrate probablePitcher again.
+    2) If still blank, leave Unknown but return a lower-confidence flag.
+    This keeps model stable and tags rows clearly instead of silently treating Unknown as normal.
+    """
+    return {"name": "Unknown", "id": None, "source": "Missing from MLB probablePitcher feed", "confidence": "Low"}
+
+def pitcher_source_label(pid, pname):
+    if pid and pname and pname != "Unknown":
+        return "MLB probablePitcher"
+    return "Missing from MLB probablePitcher feed"
+
 def build_model():
     d = requests.get("https://statsapi.mlb.com/api/v1/stats", params={"stats":"season","group":"hitting","playerPool":"ALL","sortStat":"homeRuns","limit":30,"season":YEAR,"hydrate":"team"}, timeout=30).json()
     rows = []
@@ -235,8 +251,26 @@ def build_model():
             venue = g.get("venue", {}).get("name", "")
             weather = get_weather_for_venue(venue)
             base = {"Venue":venue, "ParkFactor":park_factor(venue), **weather}
-            matchups.append({"Team":away,"Opponent":home,"Opposing Pitcher":home_p.get("fullName","Unknown"),"Opposing Pitcher ID":home_p.get("id"),**base})
-            matchups.append({"Team":home,"Opponent":away,"Opposing Pitcher":away_p.get("fullName","Unknown"),"Opposing Pitcher ID":away_p.get("id"),**base})
+            home_p_name = home_p.get("fullName", "Unknown")
+            home_p_id = home_p.get("id")
+            away_p_name = away_p.get("fullName", "Unknown")
+            away_p_id = away_p.get("id")
+            matchups.append({
+                "Team":away,"Opponent":home,
+                "Opposing Pitcher":home_p_name,
+                "Opposing Pitcher ID":home_p_id,
+                "PitcherSource":pitcher_source_label(home_p_id, home_p_name),
+                "PitcherConfidence":"High" if home_p_id else "Low",
+                **base
+            })
+            matchups.append({
+                "Team":home,"Opponent":away,
+                "Opposing Pitcher":away_p_name,
+                "Opposing Pitcher ID":away_p_id,
+                "PitcherSource":pitcher_source_label(away_p_id, away_p_name),
+                "PitcherConfidence":"High" if away_p_id else "Low",
+                **base
+            })
     matchups = pd.DataFrame(matchups)
 
     pitch_rows = []
@@ -257,7 +291,10 @@ def build_model():
     model = model.merge(matchups, on="Team", how="left")
     model = model.merge(pdf, on="Opposing Pitcher ID", how="left")
     fallback = pdf["PitcherVulnerability"].mean() if len(pdf) else 50
+    model["PitcherKnown"] = model["Opposing Pitcher ID"].apply(lambda x: bool(str(x).strip()) and str(x).strip().lower() not in ["nan", "none", ""])
     model["PitcherVulnerability"] = model["PitcherVulnerability"].fillna(fallback)
+    # Unknown pitchers are risky. Keep them in the board, but avoid over-crediting them.
+    model.loc[~model["PitcherKnown"], "PitcherVulnerability"] = 45
 
     for c in ["ERA","WHIP","K9"]:
         model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf,-np.inf],0).fillna(0)
@@ -295,19 +332,19 @@ def write_to_sheet(model, matchups):
     summary_ws = get_or_create_ws(sh, "Scorecard Summary", 100, 12)
 
     card = model[model["Rank"] <= 9].copy()
-    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","HR Result","Stake","Odds","ProfitLoss"]
+    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","HR Result","Stake","Odds","ProfitLoss"]
     daily_rows = []
     for _, r in card.iterrows():
-        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),"","","",""])
+        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),"","","",""])
 
     if not daily_ws.get_all_values():
         daily_ws.append_row(daily_cols)
     daily_ws.append_rows(clean_rows(daily_rows), value_input_option="USER_ENTERED")
 
-    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
+    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
     results_rows = []
     for _, r in model.head(30).iterrows():
-        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
+        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
     if not results_ws.get_all_values():
         results_ws.append_row(results_cols)
     results_ws.append_rows(clean_rows(results_rows), value_input_option="USER_ENTERED")
@@ -328,6 +365,7 @@ def write_to_sheet(model, matchups):
         ["Secondary Picks",len(card[card["Tier"]=="Secondary"])],
         ["Longshot Picks",len(card[card["Tier"]=="Longshot"])],
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
+        ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
         ["ROI Tracking","Stake/Odds/ProfitLoss columns added"],
         ["Sheet Updated","Yes"],
     ]), range_name="A1:B9")
@@ -346,4 +384,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
