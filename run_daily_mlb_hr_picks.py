@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V3 - Weather + Pitcher + Vegas Odds"
+MODEL_VERSION = "Automated V4 - ROI Dashboard"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -470,6 +470,158 @@ def add_odds_to_model(model):
     model = model.merge(odds_df, on="Player", how="left")
     return model
 
+
+def american_profit_on_1_unit(odds):
+    try:
+        odds = float(odds)
+        if odds > 0:
+            return odds / 100.0
+        if odds < 0:
+            return 100.0 / abs(odds)
+    except Exception:
+        pass
+    return 0.0
+
+def calculate_profit_loss(hr_result, stake, odds):
+    """
+    HR Result accepted values:
+    1, Y, YES, WIN, HR = win
+    0, N, NO, LOSS, LOSE = loss
+    blank = not graded
+    """
+    res = str(hr_result).strip().upper()
+    if res == "":
+        return ""
+    try:
+        stake = float(stake) if str(stake).strip() != "" else 1.0
+    except Exception:
+        stake = 1.0
+    try:
+        odds = float(odds)
+    except Exception:
+        return ""
+
+    if res in ["1", "Y", "YES", "WIN", "W", "HR"]:
+        return round(stake * american_profit_on_1_unit(odds), 2)
+    if res in ["0", "N", "NO", "LOSS", "LOSE", "L"]:
+        return round(-stake, 2)
+    return ""
+
+def build_roi_dashboard_rows(daily_records):
+    """
+    Builds a readable ROI Dashboard from the Daily Picks sheet.
+    Uses HR Result, Stake, and Odds columns.
+    If Stake is blank, assumes 1 unit.
+    If Odds is blank, falls back to BestHROdds when available.
+    """
+    if daily_records is None or len(daily_records) == 0:
+        return [["ROI Dashboard"], ["No Daily Picks data found"]]
+
+    df = pd.DataFrame(daily_records)
+    if df.empty:
+        return [["ROI Dashboard"], ["No Daily Picks data found"]]
+
+    # Normalize expected columns.
+    for col in ["Date","Model Version","Tier","Player","Venue","WeatherScore","HR Result","Stake","Odds","ProfitLoss","BestHROdds","ValueScore"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    df["StakeCalc"] = pd.to_numeric(df["Stake"].replace("", 1), errors="coerce").fillna(1)
+    df["OddsCalc"] = df["Odds"]
+    df.loc[df["OddsCalc"].astype(str).str.strip() == "", "OddsCalc"] = df.loc[df["OddsCalc"].astype(str).str.strip() == "", "BestHROdds"]
+    df["OddsCalc"] = pd.to_numeric(df["OddsCalc"], errors="coerce")
+
+    # Calculate missing ProfitLoss where possible.
+    calc_pl = []
+    for _, r in df.iterrows():
+        existing = str(r.get("ProfitLoss", "")).strip()
+        if existing != "":
+            try:
+                calc_pl.append(float(existing))
+                continue
+            except Exception:
+                pass
+        calc = calculate_profit_loss(r.get("HR Result", ""), r.get("StakeCalc", 1), r.get("OddsCalc", ""))
+        calc_pl.append(calc if calc != "" else np.nan)
+    df["ProfitLossCalc"] = pd.to_numeric(pd.Series(calc_pl), errors="coerce")
+
+    result_norm = df["HR Result"].astype(str).str.strip().str.upper()
+    graded = df[result_norm.isin(["1","Y","YES","WIN","W","HR","0","N","NO","LOSS","LOSE","L"])].copy()
+    if graded.empty:
+        return [
+            ["ROI Dashboard"],
+            ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            ["Status", "No graded bets yet. Enter HR Result as 1 for HR or 0 for no HR."],
+            [],
+            ["How to use"],
+            ["1", "Enter HR Result: 1 = HR, 0 = No HR"],
+            ["2", "Enter Odds if you used actual sportsbook odds"],
+            ["3", "Stake can be blank; blank assumes 1 unit"],
+            ["4", "Dashboard updates after next automated/manual run"],
+        ]
+
+    graded["Win"] = result_norm.loc[graded.index].isin(["1","Y","YES","WIN","W","HR"]).astype(int)
+    graded["Loss"] = 1 - graded["Win"]
+    graded["UnitsRisked"] = graded["StakeCalc"]
+    graded["ProfitLossCalc"] = graded["ProfitLossCalc"].fillna(0)
+
+    def summarize(group_df):
+        bets = len(group_df)
+        wins = int(group_df["Win"].sum())
+        losses = int(group_df["Loss"].sum())
+        risked = round(float(group_df["UnitsRisked"].sum()), 2)
+        profit = round(float(group_df["ProfitLossCalc"].sum()), 2)
+        hit = round((wins / bets * 100), 2) if bets else 0
+        roi = round((profit / risked * 100), 2) if risked else 0
+        return [bets, wins, losses, hit, risked, profit, roi]
+
+    rows = []
+    rows += [["ROI Dashboard"], ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")], []]
+    rows += [["Overall Performance"], ["Bets","Wins","Losses","Hit Rate %","Units Risked","Net Profit","ROI %"]]
+    rows += [summarize(graded), []]
+
+    def add_group_section(title, col):
+        nonlocal rows
+        rows += [[title], [col,"Bets","Wins","Losses","Hit Rate %","Units Risked","Net Profit","ROI %"]]
+        for key, g in graded.groupby(col, dropna=False):
+            rows.append([key] + summarize(g))
+        rows.append([])
+
+    add_group_section("By Model Version", "Model Version")
+    add_group_section("By Tier", "Tier")
+    add_group_section("By Venue", "Venue")
+
+    # Weather score buckets
+    graded["WeatherScoreNum"] = pd.to_numeric(graded["WeatherScore"], errors="coerce")
+    def wx_bucket(x):
+        if pd.isna(x):
+            return "Unknown"
+        if x < 50:
+            return "<50"
+        if x < 60:
+            return "50-59"
+        if x < 70:
+            return "60-69"
+        if x < 80:
+            return "70-79"
+        return "80+"
+    graded["Weather Bucket"] = graded["WeatherScoreNum"].apply(wx_bucket)
+    add_group_section("By Weather Score", "Weather Bucket")
+
+    return clean_rows(rows)
+
+def refresh_roi_dashboard(sh):
+    daily_ws = get_or_create_ws(sh, "Daily Picks", 1000, 50)
+    roi_ws = get_or_create_ws(sh, "ROI Dashboard", 300, 20)
+
+    records = daily_ws.get_all_records()
+    rows = build_roi_dashboard_rows(records)
+
+    roi_ws.clear()
+    # Use a wide enough range for mixed width rows.
+    roi_ws.update(values=rows, range_name=f"A1:H{len(rows)}")
+    print("ROI Dashboard updated")
+
 def write_to_sheet(model, matchups):
     gc = auth_google()
     try:
@@ -518,10 +670,11 @@ def write_to_sheet(model, matchups):
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
         ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
         ["Vegas Odds","The Odds API batter_home_runs market; BestHROdds/OddsBook/EdgePct/ValueScore added"],
-        ["ROI Tracking","Stake/Odds/ProfitLoss columns added"],
+        ["ROI Tracking","ROI Dashboard tab added; enter HR Result and actual Odds to grade bets"],
         ["Sheet Updated","Yes"],
     ]
     summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
+    refresh_roi_dashboard(sh)
     print(f"Updated Google Sheet: {SHEET_NAME}")
     return card
 
@@ -544,4 +697,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
