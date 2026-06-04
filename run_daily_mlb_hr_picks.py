@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V11 - Consensus HR Odds"
+MODEL_VERSION = "Automated V11B - Consensus HR Odds Fix"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -767,6 +767,67 @@ def write_to_sheet(model, matchups):
     refresh_roi_dashboard(sh)
     print(f"Updated Google Sheet: {SHEET_NAME}")
     return card
+
+
+def confidence_grade(row):
+    """
+    Simple readable grade for betting confidence.
+    A = strongest mix of value, model score, weather, and pitcher confidence.
+    B = playable
+    C = watchlist
+    D = low confidence
+    """
+    try:
+        score = float(row.get("Score", 0) or 0)
+        value = float(row.get("ValueScore", score) or score)
+        edge = float(row.get("EdgePct", 0) or 0)
+        wx = float(row.get("WeatherScore", 50) or 50)
+        pconf = str(row.get("PitcherConfidence", "")).lower()
+    except Exception:
+        return "C"
+
+    grade_points = 0
+    if value >= 85:
+        grade_points += 2
+    elif value >= 75:
+        grade_points += 1
+
+    if score >= 70:
+        grade_points += 2
+    elif score >= 62:
+        grade_points += 1
+
+    if edge >= 8:
+        grade_points += 2
+    elif edge >= 4:
+        grade_points += 1
+
+    if wx >= 70:
+        grade_points += 1
+
+    if pconf == "high":
+        grade_points += 1
+    elif pconf == "low":
+        grade_points -= 1
+
+    if grade_points >= 6:
+        return "A"
+    if grade_points >= 4:
+        return "B"
+    if grade_points >= 2:
+        return "C"
+    return "D"
+
+def add_value_rank_and_grade(model):
+    if "ValueScore" not in model.columns:
+        model["ValueScore"] = model["Score"]
+    model["ValueScoreNum"] = pd.to_numeric(
+        model["ValueScore"], errors="coerce"
+    ).fillna(pd.to_numeric(model["Score"], errors="coerce").fillna(0))
+    model = model.sort_values("ValueScoreNum", ascending=False).reset_index(drop=True)
+    model["ValueRank"] = model.index + 1
+    model["ConfidenceGrade"] = model.apply(confidence_grade, axis=1)
+    return model
 
 def main():
     model, matchups = build_model()
