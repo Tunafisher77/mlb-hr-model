@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V8 - Recommended Bets + ROI Analytics"
+MODEL_VERSION = "Automated V9 - True 1+ HR Odds Filter"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -337,17 +337,30 @@ def american_to_implied_pct(odds):
 
 def sanitize_hr_odds(odds):
     """
-    Some odds feeds/books can return HR prop prices with an extra zero.
-    Example: +14000 often behaves like +1400 for normal 1+ HR pricing.
-    We do NOT overwrite the raw odds silently; this returns a normalized value and a flag.
+    V9: Do not normalize suspicious odds.
+    True 1+ HR props should usually be the Over 0.5 batter_home_runs market.
+    If odds are extremely high, keep them out of BestHROdds and flag them.
     """
     try:
         o = float(odds)
     except Exception:
         return "", "Missing"
     if o > 5000:
-        return int(round(o / 10)), "Normalized from very large odds"
+        return "", "Suspicious odds ignored"
     return int(o), "OK"
+
+
+def is_true_one_plus_hr_market(point):
+    """
+    Keep only Over 0.5 home run props.
+    Exclude Over 1.5 / 2.5 alternate HR props that produce huge odds.
+    """
+    try:
+        p = float(point)
+        return abs(p - 0.5) < 0.01
+    except Exception:
+        # Some books may omit point for yes/no "to hit a HR"; allow blank only if needed.
+        return False
 
 def estimated_model_hr_prob(score):
     """
@@ -437,14 +450,23 @@ def fetch_hr_odds():
                     price = out.get("price", "")
                     if price in ["", None]:
                         continue
+
+                    # V9 critical fix: only use Over 0.5 home runs as true "to hit 1+ HR" odds.
+                    if not is_true_one_plus_hr_market(point):
+                        continue
+
                     key = normalize_name_for_odds(player)
                     if not key:
                         continue
                     current = odds_map.get(key)
-                    # For positive American odds, bigger is better. For negative odds, closer to positive is better.
                     clean_price, odds_note = sanitize_hr_odds(price)
-                    compare_price = clean_price if clean_price != "" else price
-                    if current is None or float(compare_price) > float(current["BestHROdds"]):
+
+                    # If the price is still suspicious, do not use it as BestHROdds.
+                    if clean_price == "":
+                        continue
+
+                    # For positive American odds, bigger is better. For negative odds, closer to positive is better.
+                    if current is None or float(clean_price) > float(current["BestHROdds"]):
                         odds_map[key] = {
                             "PlayerOddsName": player,
                             "BestHROdds": clean_price,
@@ -452,7 +474,7 @@ def fetch_hr_odds():
                             "OddsBook": book_title,
                             "OddsPoint": point,
                             "ImpliedProbPct": american_to_implied_pct(clean_price),
-                            "OddsNote": odds_note,
+                            "OddsNote": "True 1+ HR Over 0.5",
                         }
 
     return odds_map, status
