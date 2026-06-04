@@ -27,5 +27,7 @@ jobs:
           echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > service_account.json
 
       - name: Run MLB Model
-        run: |
-          python run_daily_mlb_hr_picks.py
+       env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      run: |
+         python run_daily_mlb_hr_picks.py
