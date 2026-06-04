@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V11E - Consensus Odds Stable Fix"
+MODEL_VERSION = "Automated V11F - Stable Consensus HR Odds"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -337,30 +337,17 @@ def american_to_implied_pct(odds):
 
 def sanitize_hr_odds(odds):
     """
-    V9: Do not normalize suspicious odds.
-    True 1+ HR props should usually be the Over 0.5 batter_home_runs market.
-    If odds are extremely high, keep them out of BestHROdds and flag them.
+    Some odds feeds/books can return HR prop prices with an extra zero.
+    Example: +14000 often behaves like +1400 for normal 1+ HR pricing.
+    We do NOT overwrite the raw odds silently; this returns a normalized value and a flag.
     """
     try:
         o = float(odds)
     except Exception:
         return "", "Missing"
     if o > 5000:
-        return "", "Suspicious odds ignored"
+        return int(round(o / 10)), "Normalized from very large odds"
     return int(o), "OK"
-
-
-def is_true_one_plus_hr_market(point):
-    """
-    Keep only Over 0.5 home run props.
-    Exclude Over 1.5 / 2.5 alternate HR props that produce huge odds.
-    """
-    try:
-        p = float(point)
-        return abs(p - 0.5) < 0.01
-    except Exception:
-        # Some books may omit point for yes/no "to hit a HR"; allow blank only if needed.
-        return False
 
 def estimated_model_hr_prob(score):
     """
@@ -373,12 +360,19 @@ def estimated_model_hr_prob(score):
     except Exception:
         return ""
 
+
+def is_true_one_plus_hr_market(point):
+    """
+    Keep only Over 0.5 home run props.
+    Exclude Over 1.5 / 2.5 alternate HR props.
+    """
+    try:
+        p = float(point)
+        return abs(p - 0.5) < 0.01
+    except Exception:
+        return False
+
 def odds_sanity_status(best_odds, avg_odds, books_found):
-    """
-    Basic anytime HR sanity checks.
-    Normal 1+ HR props usually land roughly between +150 and +1500.
-    Longshots can be higher, but anything very high should be reviewed.
-    """
     try:
         b = float(best_odds)
         a = float(avg_odds)
@@ -394,12 +388,12 @@ def odds_sanity_status(best_odds, avg_odds, books_found):
 
 def fetch_hr_odds():
     """
-    V11 odds engine:
-    - Queries The Odds API batter_home_runs market
-    - Keeps only Over 0.5 / true 1+ HR style outcomes
+    Stable consensus HR odds engine:
+    - Queries batter_home_runs
+    - Keeps only Over 0.5 HR props
     - Collects all sportsbook prices per player
-    - Removes obvious outliers
-    - Returns best odds, average odds, number of books, and best book
+    - Rejects suspicious alternate/parlay/boosted odds
+    - Returns best odds, average odds, books found, and best book
     """
     api_key = os.environ.get("ODDS_API_KEY", "")
     if not api_key:
@@ -472,8 +466,6 @@ def fetch_hr_odds():
                     if not player or price in ["", None]:
                         continue
 
-                    # Accept true 1+ HR market: Over 0.5.
-                    # Reject alternate markets like Over 1.5 / 2.5.
                     if outcome_name.lower() not in ["over", "yes"] and "over" not in outcome_name.lower():
                         continue
                     if not is_true_one_plus_hr_market(point):
@@ -484,7 +476,7 @@ def fetch_hr_odds():
                     except Exception:
                         continue
 
-                    # Hard filter obvious bad alternate/parlay/boosted results.
+                    # Hard filter obvious alternate/parlay/boosted odds.
                     if p > 2500 or p < 80:
                         continue
 
@@ -508,12 +500,11 @@ def fetch_hr_odds():
         if not prices:
             continue
 
-        # Remove outliers using simple median guard.
         values = sorted([x["price"] for x in prices])
         median = values[len(values)//2]
+
         filtered = []
         for x in prices:
-            # Keep prices within a reasonable range around median.
             if x["price"] <= median + 600 and x["price"] >= max(80, median - 400):
                 filtered.append(x)
 
@@ -582,6 +573,55 @@ def add_odds_to_model(model):
     model = model.merge(odds_df, on="Player", how="left")
     return model
 
+def confidence_grade(row):
+    """
+    Simple readable grade for betting confidence.
+    A = strongest mix of value, model score, weather, and pitcher confidence.
+    B = playable
+    C = watchlist
+    D = low confidence
+    """
+    try:
+        score = float(row.get("Score", 0) or 0)
+        value = float(row.get("ValueScore", score) or score)
+        edge = float(row.get("EdgePct", 0) or 0)
+        wx = float(row.get("WeatherScore", 50) or 50)
+        pconf = str(row.get("PitcherConfidence", "")).lower()
+    except Exception:
+        return "C"
+
+    grade_points = 0
+    if value >= 85: grade_points += 2
+    elif value >= 75: grade_points += 1
+
+    if score >= 70: grade_points += 2
+    elif score >= 62: grade_points += 1
+
+    if edge >= 8: grade_points += 2
+    elif edge >= 4: grade_points += 1
+
+    if wx >= 70: grade_points += 1
+
+    if pconf == "high": grade_points += 1
+    elif pconf == "low": grade_points -= 1
+
+    if grade_points >= 6:
+        return "A"
+    if grade_points >= 4:
+        return "B"
+    if grade_points >= 2:
+        return "C"
+    return "D"
+
+def add_value_rank_and_grade(model):
+    if "ValueScore" not in model.columns:
+        model["ValueScore"] = model["Score"]
+    model["ValueScoreNum"] = pd.to_numeric(model["ValueScore"], errors="coerce").fillna(pd.to_numeric(model["Score"], errors="coerce").fillna(0))
+    model = model.sort_values("ValueScoreNum", ascending=False).reset_index(drop=True)
+    model["ValueRank"] = model.index + 1
+    model["ConfidenceGrade"] = model.apply(confidence_grade, axis=1)
+    return model
+
 def build_email_summary_rows(card):
     rows = []
     rows.append(["Daily MLB HR Picks Email Summary"])
@@ -624,7 +664,7 @@ def refresh_email_summary(sh, card):
     ws = get_or_create_ws(sh, "Email Summary", 100, 10)
     rows = build_email_summary_rows(card)
     ws.clear()
-    ws.update(values=rows, range_name=f"A1:AZ{len(rows)}")
+    ws.update(values=rows, range_name=f"A1:B{len(rows)}")
     print("Email Summary updated")
 
 
@@ -708,28 +748,6 @@ def refresh_recommended_bets(sh, card):
     ws.update(values=clean_rows(rows), range_name=f"A1:AZ{len(rows)}")
     print("Recommended Bets updated")
 
-
-def ensure_header(ws, headers):
-    """
-    Makes sure row 1 has the full current header set.
-    This fixes missing headers caused by older model versions that had fewer columns.
-    It does not delete data.
-    """
-    existing = ws.row_values(1)
-    if existing != headers:
-        # AZ is wide enough for the current model columns.
-        ws.update(values=[headers], range_name="A1:AZ1")
-
-
-def auto_grade_daily_picks(sh):
-    """
-    Safe placeholder for auto-grading.
-    V11 is focused on correcting HR odds. Auto-grading can be re-enabled after
-    the odds engine is stable.
-    """
-    print("Auto-grading skipped in V11E; ROI still works from manually entered HR Result.")
-    return
-
 def write_to_sheet(model, matchups):
     gc = auth_google()
     try:
@@ -789,67 +807,6 @@ def write_to_sheet(model, matchups):
     refresh_roi_dashboard(sh)
     print(f"Updated Google Sheet: {SHEET_NAME}")
     return card
-
-
-def confidence_grade(row):
-    """
-    Simple readable grade for betting confidence.
-    A = strongest mix of value, model score, weather, and pitcher confidence.
-    B = playable
-    C = watchlist
-    D = low confidence
-    """
-    try:
-        score = float(row.get("Score", 0) or 0)
-        value = float(row.get("ValueScore", score) or score)
-        edge = float(row.get("EdgePct", 0) or 0)
-        wx = float(row.get("WeatherScore", 50) or 50)
-        pconf = str(row.get("PitcherConfidence", "")).lower()
-    except Exception:
-        return "C"
-
-    grade_points = 0
-    if value >= 85:
-        grade_points += 2
-    elif value >= 75:
-        grade_points += 1
-
-    if score >= 70:
-        grade_points += 2
-    elif score >= 62:
-        grade_points += 1
-
-    if edge >= 8:
-        grade_points += 2
-    elif edge >= 4:
-        grade_points += 1
-
-    if wx >= 70:
-        grade_points += 1
-
-    if pconf == "high":
-        grade_points += 1
-    elif pconf == "low":
-        grade_points -= 1
-
-    if grade_points >= 6:
-        return "A"
-    if grade_points >= 4:
-        return "B"
-    if grade_points >= 2:
-        return "C"
-    return "D"
-
-def add_value_rank_and_grade(model):
-    if "ValueScore" not in model.columns:
-        model["ValueScore"] = model["Score"]
-    model["ValueScoreNum"] = pd.to_numeric(
-        model["ValueScore"], errors="coerce"
-    ).fillna(pd.to_numeric(model["Score"], errors="coerce").fillna(0))
-    model = model.sort_values("ValueScoreNum", ascending=False).reset_index(drop=True)
-    model["ValueRank"] = model.index + 1
-    model["ConfidenceGrade"] = model.apply(confidence_grade, axis=1)
-    return model
 
 def main():
     model, matchups = build_model()
