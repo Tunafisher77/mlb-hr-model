@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V11C - Consensus HR Odds Header Fix"
+MODEL_VERSION = "Automated V11D - Recommended Bets Range Fix"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -624,7 +624,7 @@ def refresh_email_summary(sh, card):
     ws = get_or_create_ws(sh, "Email Summary", 100, 10)
     rows = build_email_summary_rows(card)
     ws.clear()
-    ws.update(values=rows, range_name=f"A1:B{len(rows)}")
+    ws.update(values=rows, range_name=f"A1:AZ{len(rows)}")
     print("Email Summary updated")
 
 
@@ -705,7 +705,7 @@ def refresh_recommended_bets(sh, card):
         ])
 
     ws.clear()
-    ws.update(values=clean_rows(rows), range_name=f"A1:S{len(rows)}")
+    ws.update(values=clean_rows(rows), range_name=f"A1:AZ{len(rows)}")
     print("Recommended Bets updated")
 
 
