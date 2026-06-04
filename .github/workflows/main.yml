@@ -4,7 +4,6 @@ on:
   schedule:
     # Runs at 6:50 AM Pacific during daylight time.
     # GitHub schedules use UTC. 13:50 UTC = 6:50 AM PDT.
-    # This gives the sheet time to update before the 7:00 AM email trigger.
     - cron: '50 13 * * *'
   workflow_dispatch:
 
@@ -31,4 +30,5 @@ jobs:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           python run_daily_mlb_hr_picks.py
+
 
