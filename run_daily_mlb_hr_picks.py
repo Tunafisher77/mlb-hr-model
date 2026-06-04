@@ -1,4 +1,5 @@
-import os, json, math, requests
+import os
+import re, json, math, requests
 import pandas as pd
 import numpy as np
 from datetime import date, timedelta, datetime
@@ -10,7 +11,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V12 - Fuzzy Odds Match + 7AM Email"
+MODEL_VERSION = "Automated V12B - Fuzzy Odds Import Fix"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
