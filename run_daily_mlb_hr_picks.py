@@ -11,7 +11,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V12B - Fuzzy Odds Import Fix"
+MODEL_VERSION = "Automated V12C - Odds Coverage + Clean Email"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -350,8 +350,16 @@ def odds_name_match_score(model_name, odds_name):
         return 95
     if m_last == o_last and m_first[0:1] == o_first[0:1]:
         return 88
-    if len(m_last) >= 5 and m_last == o_last:
+
+    # More sportsbook-name fallbacks:
+    # Some feeds include extra text or team abbreviations in the player description.
+    if len(m_last) >= 5 and m_last in o:
+        return 84
+    if len(m_last) >= 5 and m_last in " ".join(o):
+        return 83
+    if len(m_last) >= 5 and o_last == m_last:
         return 82
+
     return 0
 
 def find_best_odds_match(model_player, odds_map):
@@ -369,7 +377,7 @@ def find_best_odds_match(model_player, odds_map):
             best_score = score
             best_item = item
 
-    if best_score >= 82:
+    if best_score >= 80:
         item = dict(best_item)
         item["MatchScore"] = best_score
         return item
@@ -681,32 +689,45 @@ def build_email_summary_rows(card):
     rows.append(["Model Version", MODEL_VERSION])
     rows.append([])
     rows.append(["Recommended Bets"])
+
     rec = card[card.get("ConfidenceGrade", "").isin(["A","B"])] if "ConfidenceGrade" in card.columns else pd.DataFrame()
     if rec.empty:
-        rec = card.sort_values("ValueRank" if "ValueRank" in card.columns else "Rank").head(3)
+        rec = card.sort_values("ValueRank" if "ValueRank" in card.columns else "Rank").head(5)
     else:
         rec = rec.sort_values("ValueRank").head(5)
+
     for _, r in rec.iterrows():
-        odds_txt = f" +{r.get('BestHROdds','')}" if str(r.get("BestHROdds","")).strip() else ""
+        odds = str(r.get("BestHROdds","")).strip()
+        odds_txt = f"+{odds}" if odds else "Odds pending"
+        edge = str(r.get("EdgePct","")).strip()
+        edge_txt = f"Edge {edge}" if edge else "Edge pending"
         rows.append([
             r.get("ConfidenceGrade", ""),
-            f"Value #{r.get('ValueRank','')} | {r['Player']} ({r['Team']}){odds_txt} — Score {round(float(r['Score']),1)} | Edge {r.get('EdgePct','')} | {r.get('WindImpact','')}"
+            f"Value #{r.get('ValueRank','')} | {r['Player']} ({r['Team']}) | {odds_txt} | Score {round(float(r['Score']),1)} | {edge_txt} | Weather {r.get('WeatherScore','')} | Wind {r.get('WindImpact','')}"
         ])
+
     rows.append([])
     for tier in ["Primary", "Secondary", "Longshot"]:
         rows.append([tier])
         tier_df = card[card["Tier"] == tier].copy()
         for _, r in tier_df.iterrows():
-            odds_txt = f" +{r.get('BestHROdds','')}" if str(r.get("BestHROdds","")).strip() else ""
-            edge_txt = f" | Edge {r.get('EdgePct','')}" if str(r.get("EdgePct","")).strip() else ""
+            odds = str(r.get("BestHROdds","")).strip()
+            odds_txt = f"+{odds}" if odds else "Odds pending"
+            edge = str(r.get("EdgePct","")).strip()
+            edge_txt = f" | Edge {edge}" if edge else " | Edge pending"
             weather_txt = f" | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
             grade = r.get("ConfidenceGrade", "")
             value_rank = r.get("ValueRank", "")
             rows.append([
                 int(r["Rank"]),
-                f"{grade} | Value #{value_rank} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']}{odds_txt} — Score {round(float(r['Score']),1)}{edge_txt}{weather_txt}"
+                f"{grade} | Value #{value_rank} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | {odds_txt} — Score {round(float(r['Score']),1)}{edge_txt}{weather_txt}"
             ])
         rows.append([])
+
+    missing = card[card["BestHROdds"].astype(str).str.strip() == ""] if "BestHROdds" in card.columns else pd.DataFrame()
+    if not missing.empty:
+        rows.append(["Odds Coverage Note"])
+        rows.append([f"{len(missing)} picks are missing sportsbook odds from the API feed right now. The model still ranks them, but Edge is pending until odds populate."])
     rows.append(["Notes"])
     rows.append(["Use actual sportsbook odds in Daily Picks Odds column for ROI grading."])
     rows.append(["HR Result: 1 = HR, 0 = No HR."])
