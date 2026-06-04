@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V11B - Consensus HR Odds Fix"
+MODEL_VERSION = "Automated V11C - Consensus HR Odds Header Fix"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -707,6 +707,18 @@ def refresh_recommended_bets(sh, card):
     ws.clear()
     ws.update(values=clean_rows(rows), range_name=f"A1:S{len(rows)}")
     print("Recommended Bets updated")
+
+
+def ensure_header(ws, headers):
+    """
+    Makes sure row 1 has the full current header set.
+    This fixes missing headers caused by older model versions that had fewer columns.
+    It does not delete data.
+    """
+    existing = ws.row_values(1)
+    if existing != headers:
+        # AZ is wide enough for the current model columns.
+        ws.update(values=[headers], range_name="A1:AZ1")
 
 def write_to_sheet(model, matchups):
     gc = auth_google()
