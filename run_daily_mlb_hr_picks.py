@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V11F - Stable Consensus HR Odds"
+MODEL_VERSION = "Automated V11H - Consensus Odds Stabilized"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -748,6 +748,34 @@ def refresh_recommended_bets(sh, card):
     ws.update(values=clean_rows(rows), range_name=f"A1:AZ{len(rows)}")
     print("Recommended Bets updated")
 
+
+def ensure_header(ws, headers):
+    """
+    Makes sure row 1 has the full current header set.
+    This fixes missing headers caused by older model versions that had fewer columns.
+    It does not delete data.
+    """
+    existing = ws.row_values(1)
+    if existing != headers:
+        ws.update(values=[headers], range_name="A1:AZ1")
+
+
+def auto_grade_daily_picks(sh):
+    """
+    Safe auto-grading placeholder for V11H.
+    We are stabilizing consensus HR odds first. Manual HR Result grading still works.
+    """
+    print("Auto-grading skipped in V11H; ROI still works from manually entered HR Result.")
+    return
+
+def refresh_roi_dashboard(sh):
+    """
+    Safe ROI refresh placeholder for V11H.
+    Existing ROI Dashboard remains in the sheet. We are stabilizing consensus HR odds first.
+    """
+    print("ROI Dashboard refresh skipped in V11H while odds engine is stabilized.")
+    return
+
 def write_to_sheet(model, matchups):
     gc = auth_google()
     try:
@@ -828,4 +856,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
