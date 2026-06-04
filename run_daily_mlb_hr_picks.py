@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V6 - Email Summary + Odds Sanity"
+MODEL_VERSION = "Automated V7 - Value Rank + Confidence Grade"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -624,6 +624,8 @@ def build_roi_dashboard_rows(daily_records):
 
     add_group_section("By Model Version", "Model Version")
     add_group_section("By Tier", "Tier")
+    if "ConfidenceGrade" in graded.columns:
+        add_group_section("By Confidence Grade", "ConfidenceGrade")
     add_group_section("By Venue", "Venue")
 
     # Weather score buckets
@@ -754,6 +756,56 @@ def auto_grade_daily_picks(sh):
         print(f"Auto-grading skipped: {e}")
 
 
+
+def confidence_grade(row):
+    """
+    Simple readable grade for betting confidence.
+    A = strongest mix of value, model score, weather, and pitcher confidence.
+    B = playable
+    C = watchlist
+    D = low confidence
+    """
+    try:
+        score = float(row.get("Score", 0) or 0)
+        value = float(row.get("ValueScore", score) or score)
+        edge = float(row.get("EdgePct", 0) or 0)
+        wx = float(row.get("WeatherScore", 50) or 50)
+        pconf = str(row.get("PitcherConfidence", "")).lower()
+    except Exception:
+        return "C"
+
+    grade_points = 0
+    if value >= 85: grade_points += 2
+    elif value >= 75: grade_points += 1
+
+    if score >= 70: grade_points += 2
+    elif score >= 62: grade_points += 1
+
+    if edge >= 8: grade_points += 2
+    elif edge >= 4: grade_points += 1
+
+    if wx >= 70: grade_points += 1
+
+    if pconf == "high": grade_points += 1
+    elif pconf == "low": grade_points -= 1
+
+    if grade_points >= 6:
+        return "A"
+    if grade_points >= 4:
+        return "B"
+    if grade_points >= 2:
+        return "C"
+    return "D"
+
+def add_value_rank_and_grade(model):
+    if "ValueScore" not in model.columns:
+        model["ValueScore"] = model["Score"]
+    model["ValueScoreNum"] = pd.to_numeric(model["ValueScore"], errors="coerce").fillna(pd.to_numeric(model["Score"], errors="coerce").fillna(0))
+    model = model.sort_values("ValueScoreNum", ascending=False).reset_index(drop=True)
+    model["ValueRank"] = model.index + 1
+    model["ConfidenceGrade"] = model.apply(confidence_grade, axis=1)
+    return model
+
 def build_email_summary_rows(card):
     rows = []
     rows.append(["Daily MLB HR Picks Email Summary"])
@@ -767,9 +819,11 @@ def build_email_summary_rows(card):
             odds_txt = f" +{r.get('BestHROdds','')}" if str(r.get("BestHROdds","")).strip() else ""
             edge_txt = f" | Edge {r.get('EdgePct','')}" if str(r.get("EdgePct","")).strip() else ""
             weather_txt = f" | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
+            grade = r.get("ConfidenceGrade", "")
+            value_rank = r.get("ValueRank", "")
             rows.append([
                 int(r["Rank"]),
-                f"{r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']}{odds_txt} — Score {round(float(r['Score']),1)}{edge_txt}{weather_txt}"
+                f"{grade} | Value #{value_rank} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']}{odds_txt} — Score {round(float(r['Score']),1)}{edge_txt}{weather_txt}"
             ])
         rows.append([])
     rows.append(["Notes"])
@@ -797,18 +851,18 @@ def write_to_sheet(model, matchups):
     summary_ws = get_or_create_ws(sh, "Scorecard Summary", 100, 12)
 
     card = model[model["Rank"] <= 9].copy()
-    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","OddsStatus","HR Result","Stake","Odds","ProfitLoss"]
+    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","ValueRank","ConfidenceGrade","OddsStatus","HR Result","Stake","Odds","ProfitLoss"]
     daily_rows = []
     for _, r in card.iterrows():
-        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("OddsStatus",""),"","","",""])
+        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("ValueRank",""),r.get("ConfidenceGrade",""),r.get("OddsStatus",""),"","","",""])
 
     ensure_header(daily_ws, daily_cols)
     daily_ws.append_rows(clean_rows(daily_rows), value_input_option="USER_ENTERED")
 
-    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","OddsStatus","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
+    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","ValueRank","ConfidenceGrade","OddsStatus","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
     results_rows = []
     for _, r in model.head(30).iterrows():
-        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("OddsStatus",""),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
+        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("ValueRank",""),r.get("ConfidenceGrade",""),r.get("OddsStatus",""),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
     ensure_header(results_ws, results_cols)
     results_ws.append_rows(clean_rows(results_rows), value_input_option="USER_ENTERED")
 
@@ -830,7 +884,8 @@ def write_to_sheet(model, matchups):
         ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
         ["Vegas Odds","The Odds API batter_home_runs market; BestHROdds/OddsBook/EdgePct/ValueScore added"],
         ["ROI Tracking","ROI Dashboard tab added; headers auto-repaired; past-game auto-grading started"],
-        ["Email Summary","Email Summary tab added for Matt/app script"],
+        ["Value Ranking","ValueRank and ConfidenceGrade added"],
+        ["Email Summary","Email Summary tab upgraded for Matt/app script"],
         ["Sheet Updated","Yes"],
     ]
     summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
@@ -843,6 +898,7 @@ def write_to_sheet(model, matchups):
 def main():
     model, matchups = build_model()
     model = add_odds_to_model(model)
+    model = add_value_rank_and_grade(model)
     # Value-aware rank after odds are added. If no odds are available, ValueScore equals Score.
     if 'ValueScore' in model.columns:
         model = model.sort_values('ValueScore', ascending=False).reset_index(drop=True)
