@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V5 - Header Fix + ROI Cleanup"
+MODEL_VERSION = "Automated V5B - ROI Type Fix"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -537,9 +537,12 @@ def build_roi_dashboard_rows(daily_records):
         if col not in df.columns:
             df[col] = ""
 
-    df["StakeCalc"] = pd.to_numeric(df["Stake"].replace("", 1), errors="coerce").fillna(1)
-    df["OddsCalc"] = df["Odds"]
-    df.loc[df["OddsCalc"].astype(str).str.strip() == "", "OddsCalc"] = df.loc[df["OddsCalc"].astype(str).str.strip() == "", "BestHROdds"]
+    # Force object/string-safe columns before mixing manual Odds and BestHROdds.
+    # This avoids pandas Arrow string assignment errors in GitHub Actions.
+    df["StakeCalc"] = pd.to_numeric(df["Stake"].astype(str).replace("", "1"), errors="coerce").fillna(1)
+    odds_manual = df["Odds"].astype(str).replace("nan", "").str.strip()
+    odds_best = df["BestHROdds"].astype(str).replace("nan", "").str.strip()
+    df["OddsCalc"] = odds_manual.where(odds_manual != "", odds_best)
     df["OddsCalc"] = pd.to_numeric(df["OddsCalc"], errors="coerce")
 
     # Calculate missing ProfitLoss where possible.
@@ -554,7 +557,7 @@ def build_roi_dashboard_rows(daily_records):
                 pass
         calc = calculate_profit_loss(r.get("HR Result", ""), r.get("StakeCalc", 1), r.get("OddsCalc", ""))
         calc_pl.append(calc if calc != "" else np.nan)
-    df["ProfitLossCalc"] = pd.to_numeric(pd.Series(calc_pl), errors="coerce")
+    df["ProfitLossCalc"] = pd.to_numeric(pd.Series(calc_pl, dtype="object"), errors="coerce")
 
     result_norm = df["HR Result"].astype(str).str.strip().str.upper()
     graded = df[result_norm.isin(["1","Y","YES","WIN","W","HR","0","N","NO","LOSS","LOSE","L"])].copy()
