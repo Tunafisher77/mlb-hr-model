@@ -10,7 +10,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V7 - Value Rank + Confidence Grade"
+MODEL_VERSION = "Automated V8 - Recommended Bets + ROI Analytics"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -626,6 +626,8 @@ def build_roi_dashboard_rows(daily_records):
     add_group_section("By Tier", "Tier")
     if "ConfidenceGrade" in graded.columns:
         add_group_section("By Confidence Grade", "ConfidenceGrade")
+    graded["Odds Bucket"] = graded["OddsCalc"].apply(odds_bucket)
+    add_group_section("By Odds Range", "Odds Bucket")
     add_group_section("By Venue", "Venue")
 
     # Weather score buckets
@@ -812,6 +814,19 @@ def build_email_summary_rows(card):
     rows.append(["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
     rows.append(["Model Version", MODEL_VERSION])
     rows.append([])
+    rows.append(["Recommended Bets"])
+    rec = card[card.get("ConfidenceGrade", "").isin(["A","B"])] if "ConfidenceGrade" in card.columns else pd.DataFrame()
+    if rec.empty:
+        rec = card.sort_values("ValueRank" if "ValueRank" in card.columns else "Rank").head(3)
+    else:
+        rec = rec.sort_values("ValueRank").head(5)
+    for _, r in rec.iterrows():
+        odds_txt = f" +{r.get('BestHROdds','')}" if str(r.get("BestHROdds","")).strip() else ""
+        rows.append([
+            r.get("ConfidenceGrade", ""),
+            f"Value #{r.get('ValueRank','')} | {r['Player']} ({r['Team']}){odds_txt} — Score {round(float(r['Score']),1)} | Edge {r.get('EdgePct','')} | {r.get('WindImpact','')}"
+        ])
+    rows.append([])
     for tier in ["Primary", "Secondary", "Longshot"]:
         rows.append([tier])
         tier_df = card[card["Tier"] == tier].copy()
@@ -837,6 +852,84 @@ def refresh_email_summary(sh, card):
     ws.clear()
     ws.update(values=rows, range_name=f"A1:B{len(rows)}")
     print("Email Summary updated")
+
+
+def odds_bucket(odds):
+    try:
+        o = float(odds)
+    except Exception:
+        return "No Odds"
+    if o < 300:
+        return "< +300"
+    if o < 600:
+        return "+300 to +599"
+    if o < 1000:
+        return "+600 to +999"
+    if o < 1500:
+        return "+1000 to +1499"
+    if o < 2500:
+        return "+1500 to +2499"
+    return "+2500+"
+
+def refresh_recommended_bets(sh, card):
+    """
+    Creates a clean recommendation tab so Matt sees the best playable bets only.
+    Keeps all 9 picks in Daily Picks, but this tab filters to stronger grades.
+    """
+    ws = get_or_create_ws(sh, "Recommended Bets", 100, 20)
+    rec = card.copy()
+
+    # Prefer A/B grades, but if there are fewer than 3, show top ValueRank picks.
+    if "ConfidenceGrade" in rec.columns:
+        filtered = rec[rec["ConfidenceGrade"].isin(["A", "B"])].copy()
+    else:
+        filtered = pd.DataFrame()
+
+    if len(filtered) < 3:
+        filtered = rec.sort_values("ValueRank" if "ValueRank" in rec.columns else "Rank").head(5).copy()
+    else:
+        filtered = filtered.sort_values("ValueRank").head(7).copy()
+
+    headers = [
+        "Date","Grade","ValueRank","Tier","Player","Team","Opponent","Opposing Pitcher",
+        "Venue","Score","ValueScore","BestHROdds","RawHROdds","OddsBook","EdgePct",
+        "WeatherScore","WindImpact","PitcherConfidence","Recommendation"
+    ]
+    rows = [["Recommended Bets"], ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")], [], headers]
+
+    for _, r in filtered.iterrows():
+        grade = r.get("ConfidenceGrade", "")
+        if grade == "A":
+            note = "Strong play"
+        elif grade == "B":
+            note = "Playable"
+        else:
+            note = "Watchlist"
+        rows.append([
+            TODAY.isoformat(),
+            grade,
+            r.get("ValueRank",""),
+            r.get("Tier",""),
+            r.get("Player",""),
+            r.get("Team",""),
+            r.get("Opponent",""),
+            r.get("Opposing Pitcher",""),
+            r.get("Venue",""),
+            round(float(r.get("Score",0)),2),
+            r.get("ValueScore",""),
+            r.get("BestHROdds",""),
+            r.get("RawHROdds",""),
+            r.get("OddsBook",""),
+            r.get("EdgePct",""),
+            r.get("WeatherScore",""),
+            r.get("WindImpact",""),
+            r.get("PitcherConfidence",""),
+            note
+        ])
+
+    ws.clear()
+    ws.update(values=clean_rows(rows), range_name=f"A1:S{len(rows)}")
+    print("Recommended Bets updated")
 
 def write_to_sheet(model, matchups):
     gc = auth_google()
@@ -885,10 +978,13 @@ def write_to_sheet(model, matchups):
         ["Vegas Odds","The Odds API batter_home_runs market; BestHROdds/OddsBook/EdgePct/ValueScore added"],
         ["ROI Tracking","ROI Dashboard tab added; headers auto-repaired; past-game auto-grading started"],
         ["Value Ranking","ValueRank and ConfidenceGrade added"],
+        ["Recommended Bets","Recommended Bets tab added"],
+        ["ROI Analytics","ROI Dashboard adds By Odds Range"],
         ["Email Summary","Email Summary tab upgraded for Matt/app script"],
         ["Sheet Updated","Yes"],
     ]
     summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
+    refresh_recommended_bets(sh, card)
     refresh_email_summary(sh, card)
     auto_grade_daily_picks(sh)
     refresh_roi_dashboard(sh)
@@ -915,3 +1011,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
