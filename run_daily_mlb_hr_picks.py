@@ -11,7 +11,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V13 - Clean HR Targets + Active Roster Filter"
+MODEL_VERSION = "Automated V13.1 - Confidence Labels + Clean HR Targets"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -243,15 +243,21 @@ def fetch_active_roster_player_ids(team_ids):
     return active_ids
 
 def target_label_from_score(score):
+    """
+    Baseball confidence label for HR target quality.
+    These thresholds are intentionally easier to read than the old betting grades.
+    """
     try:
         s = float(score)
     except Exception:
         return "Watchlist"
-    if s >= 85:
+    if s >= 70:
         return "Elite Target"
-    if s >= 75:
+    if s >= 60:
         return "Strong Target"
-    if s >= 65:
+    if s >= 50:
+        return "Solid Target"
+    if s >= 40:
         return "Watchlist"
     return "Longshot"
 
@@ -759,7 +765,6 @@ def build_email_summary_rows(card):
     rows.append(["Model Notes"])
     rows.append(["Ranking Basis", "Season power, recent HR form, hard-hit contact, 100+ MPH contact, fly-ball profile, pitcher vulnerability, park factor, and weather/wind."])
     rows.append(["Inactive Player Filter", "Players not on active rosters are removed before scoring."])
-    rows.append(["Betting/Odds", "Removed from V13. Use your sportsbook separately if needed."])
     rows.append([])
     rows.append(["Results Tracking"])
     rows.append(["HR Result", "1 = HR, 0 = No HR."])
@@ -883,9 +888,8 @@ def write_to_sheet(model, matchups):
         ["Longshot Picks",len(card[card["Tier"]=="Longshot"])],
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
         ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
-        ["Odds/Betting","Removed in V13; model ranks baseball HR targets only"],
         ["Results Tracking","Manual HR Result remains: 1 = HR, 0 = No HR"],
-        ["Target Ranking","ConfidenceLabel and Reason added"],
+        ["Target Ranking","V13.1 confidence labels recalibrated: Elite, Strong, Solid, Watchlist, Longshot"],
         ["HR Targets","HR Targets tab added"],
         ["Inactive Filter","Active roster filter added before scoring"],
         ["Email Summary","Email Summary tab upgraded for clean V13 email"],
