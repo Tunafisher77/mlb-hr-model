@@ -11,7 +11,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V12C - Odds Coverage + Clean Email"
+MODEL_VERSION = "Automated V13 - Clean HR Targets + Active Roster Filter"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -218,12 +218,81 @@ def pitcher_source_label(pid, pname):
         return "MLB probablePitcher"
     return "Missing from MLB probablePitcher feed"
 
+
+def fetch_active_roster_player_ids(team_ids):
+    """
+    Pulls active roster for today's scheduled teams.
+    This removes IL/out/inactive players before scoring.
+    If MLB roster API fails, returns an empty set and the model continues instead of crashing.
+    """
+    active_ids = set()
+    for tid in sorted(set([x for x in team_ids if x])):
+        try:
+            data = requests.get(
+                f"https://statsapi.mlb.com/api/v1/teams/{int(tid)}/roster",
+                params={"rosterType":"active"},
+                timeout=20
+            ).json()
+            for item in data.get("roster", []):
+                person = item.get("person", {})
+                pid = person.get("id")
+                if pid:
+                    active_ids.add(int(pid))
+        except Exception as e:
+            print(f"Active roster lookup failed for team {tid}: {e}")
+    return active_ids
+
+def target_label_from_score(score):
+    try:
+        s = float(score)
+    except Exception:
+        return "Watchlist"
+    if s >= 85:
+        return "Elite Target"
+    if s >= 75:
+        return "Strong Target"
+    if s >= 65:
+        return "Watchlist"
+    return "Longshot"
+
+def factor_label(value, high=70, low=45):
+    try:
+        v = float(value)
+    except Exception:
+        return "Neutral"
+    if v >= high:
+        return "Strong"
+    if v <= low:
+        return "Weak"
+    return "Neutral"
+
+def build_reason_text(row):
+    parts = []
+    try:
+        if float(row.get("HardHit%", 0) or 0) >= 45:
+            parts.append("strong hard-hit profile")
+        if float(row.get("100+MPH%", 0) or 0) >= 20:
+            parts.append("frequent 100+ MPH contact")
+        if float(row.get("Last7HR", 0) or 0) >= 1:
+            parts.append("recent HR form")
+        if float(row.get("PitcherVulnerability", 0) or 0) >= 65:
+            parts.append("favorable pitcher matchup")
+        if float(row.get("WeatherScore", 50) or 50) >= 65:
+            parts.append(f"favorable weather/wind: {row.get('WindImpact','')}")
+        if float(row.get("ParkFactor", 100) or 100) >= 108:
+            parts.append("HR-friendly park")
+    except Exception:
+        pass
+    if not parts:
+        parts.append("balanced power/matchup profile")
+    return "; ".join(parts)
+
 def build_model():
     d = requests.get("https://statsapi.mlb.com/api/v1/stats", params={"stats":"season","group":"hitting","playerPool":"ALL","sortStat":"homeRuns","limit":30,"season":YEAR,"hydrate":"team"}, timeout=30).json()
     rows = []
     for s in d.get("stats", [{}])[0].get("splits", []):
         team = s.get("team", {})
-        rows.append({"Player":s.get("player", {}).get("fullName"),"Player ID":s.get("player", {}).get("id"),"Team":team_abbrev(team),"Team Name":team.get("name", ""),"Season HR":int(s.get("stat", {}).get("homeRuns", 0) or 0)})
+        rows.append({"Player":s.get("player", {}).get("fullName"),"Player ID":s.get("player", {}).get("id"),"Team":team_abbrev(team),"Team ID":team.get("id"),"Team Name":team.get("name", ""),"Season HR":int(s.get("stat", {}).get("homeRuns", 0) or 0)})
     model = pd.DataFrame(rows)
 
     out = []
@@ -241,11 +310,13 @@ def build_model():
     model = model.merge(pd.DataFrame(out, columns=["Player","HardHit%","100+MPH%","FlyBall%","Last7HR"]), on="Player", how="left")
 
     sched = requests.get("https://statsapi.mlb.com/api/v1/schedule", params={"sportId":1,"date":TODAY.isoformat(),"hydrate":"probablePitcher,team"}, timeout=30).json()
+    todays_team_ids = []
     matchups = []
     for d in sched.get("dates", []):
         for g in d.get("games", []):
             away_team = g["teams"]["away"]["team"]
             home_team = g["teams"]["home"]["team"]
+            todays_team_ids.extend([away_team.get("id"), home_team.get("id")])
             away = team_abbrev(away_team); home = team_abbrev(home_team)
             away_p = g["teams"]["away"].get("probablePitcher", {})
             home_p = g["teams"]["home"].get("probablePitcher", {})
@@ -273,6 +344,16 @@ def build_model():
                 **base
             })
     matchups = pd.DataFrame(matchups)
+
+    # V13 safety filter: only score players on active rosters for teams playing today.
+    active_ids = fetch_active_roster_player_ids(todays_team_ids)
+    if active_ids:
+        before_count = len(model)
+        model["Player ID"] = pd.to_numeric(model["Player ID"], errors="coerce").fillna(0).astype(int)
+        model = model[model["Player ID"].isin(active_ids)].copy()
+        print(f"Active roster filter: {before_count} candidates -> {len(model)} active candidates")
+    else:
+        print("Active roster filter skipped: roster feed unavailable")
 
     pitch_rows = []
     for pid, pname in matchups[["Opposing Pitcher ID","Opposing Pitcher"]].drop_duplicates().dropna().values:
@@ -634,104 +715,56 @@ def add_odds_to_model(model):
     return model
 
 def confidence_grade(row):
-    """
-    Simple readable grade for betting confidence.
-    A = strongest mix of value, model score, weather, and pitcher confidence.
-    B = playable
-    C = watchlist
-    D = low confidence
-    """
-    try:
-        score = float(row.get("Score", 0) or 0)
-        value = float(row.get("ValueScore", score) or score)
-        edge = float(row.get("EdgePct", 0) or 0)
-        wx = float(row.get("WeatherScore", 50) or 50)
-        pconf = str(row.get("PitcherConfidence", "")).lower()
-    except Exception:
-        return "C"
+    """Baseball target label, not betting grade."""
+    return target_label_from_score(row.get("Score", 0))
 
-    grade_points = 0
-    if value >= 85: grade_points += 2
-    elif value >= 75: grade_points += 1
 
-    if score >= 70: grade_points += 2
-    elif score >= 62: grade_points += 1
-
-    if edge >= 8: grade_points += 2
-    elif edge >= 4: grade_points += 1
-
-    if wx >= 70: grade_points += 1
-
-    if pconf == "high": grade_points += 1
-    elif pconf == "low": grade_points -= 1
-
-    if grade_points >= 6:
-        return "A"
-    if grade_points >= 4:
-        return "B"
-    if grade_points >= 2:
-        return "C"
-    return "D"
-
-def add_value_rank_and_grade(model):
-    if "ValueScore" not in model.columns:
-        model["ValueScore"] = model["Score"]
-    model["ValueScoreNum"] = pd.to_numeric(model["ValueScore"], errors="coerce").fillna(pd.to_numeric(model["Score"], errors="coerce").fillna(0))
-    model = model.sort_values("ValueScoreNum", ascending=False).reset_index(drop=True)
-    model["ValueRank"] = model.index + 1
-    model["ConfidenceGrade"] = model.apply(confidence_grade, axis=1)
+def add_target_rank_and_confidence(model):
+    model = model.sort_values("Score", ascending=False).reset_index(drop=True)
+    model["Rank"] = model.index + 1
+    model["Group"] = model["Rank"].apply(lambda x: "Group 1" if x <= 10 else ("Group 2" if x <= 20 else "Group 3"))
+    model["Tier"] = model["Rank"].apply(tier_from_rank)
+    model["ConfidenceLabel"] = model.apply(confidence_grade, axis=1)
+    model["Reason"] = model.apply(build_reason_text, axis=1)
     return model
+
 
 def build_email_summary_rows(card):
     rows = []
-    rows.append(["Daily MLB HR Picks Email Summary"])
+    rows.append(["Daily MLB HR Targets Email Summary"])
     rows.append(["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
     rows.append(["Model Version", MODEL_VERSION])
     rows.append([])
-    rows.append(["Recommended Bets"])
 
-    rec = card[card.get("ConfidenceGrade", "").isin(["A","B"])] if "ConfidenceGrade" in card.columns else pd.DataFrame()
-    if rec.empty:
-        rec = card.sort_values("ValueRank" if "ValueRank" in card.columns else "Rank").head(5)
-    else:
-        rec = rec.sort_values("ValueRank").head(5)
-
-    for _, r in rec.iterrows():
-        odds = str(r.get("BestHROdds","")).strip()
-        odds_txt = f"+{odds}" if odds else "Odds pending"
-        edge = str(r.get("EdgePct","")).strip()
-        edge_txt = f"Edge {edge}" if edge else "Edge pending"
+    rows.append(["Top HR Targets"])
+    top = card.sort_values("Rank").head(5)
+    for _, r in top.iterrows():
         rows.append([
-            r.get("ConfidenceGrade", ""),
-            f"Value #{r.get('ValueRank','')} | {r['Player']} ({r['Team']}) | {odds_txt} | Score {round(float(r['Score']),1)} | {edge_txt} | Weather {r.get('WeatherScore','')} | Wind {r.get('WindImpact','')}"
+            int(r.get("Rank", 0)),
+            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
         ])
+        rows.append(["", f"Why: {r.get('Reason','')}"])
 
     rows.append([])
-    for tier in ["Primary", "Secondary", "Longshot"]:
-        rows.append([tier])
-        tier_df = card[card["Tier"] == tier].copy()
-        for _, r in tier_df.iterrows():
-            odds = str(r.get("BestHROdds","")).strip()
-            odds_txt = f"+{odds}" if odds else "Odds pending"
-            edge = str(r.get("EdgePct","")).strip()
-            edge_txt = f" | Edge {edge}" if edge else " | Edge pending"
-            weather_txt = f" | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
-            grade = r.get("ConfidenceGrade", "")
-            value_rank = r.get("ValueRank", "")
-            rows.append([
-                int(r["Rank"]),
-                f"{grade} | Value #{value_rank} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | {odds_txt} — Score {round(float(r['Score']),1)}{edge_txt}{weather_txt}"
-            ])
-        rows.append([])
+    rows.append(["Watchlist"])
+    watch = card.sort_values("Rank").iloc[5:9]
+    for _, r in watch.iterrows():
+        rows.append([
+            int(r.get("Rank", 0)),
+            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
+        ])
+        rows.append(["", f"Why: {r.get('Reason','')}"])
 
-    missing = card[card["BestHROdds"].astype(str).str.strip() == ""] if "BestHROdds" in card.columns else pd.DataFrame()
-    if not missing.empty:
-        rows.append(["Odds Coverage Note"])
-        rows.append([f"{len(missing)} picks are missing sportsbook odds from the API feed right now. The model still ranks them, but Edge is pending until odds populate."])
-    rows.append(["Notes"])
-    rows.append(["Use actual sportsbook odds in Daily Picks Odds column for ROI grading."])
-    rows.append(["HR Result: 1 = HR, 0 = No HR."])
+    rows.append([])
+    rows.append(["Model Notes"])
+    rows.append(["Ranking Basis", "Season power, recent HR form, hard-hit contact, 100+ MPH contact, fly-ball profile, pitcher vulnerability, park factor, and weather/wind."])
+    rows.append(["Inactive Player Filter", "Players not on active rosters are removed before scoring."])
+    rows.append(["Betting/Odds", "Removed from V13. Use your sportsbook separately if needed."])
+    rows.append([])
+    rows.append(["Results Tracking"])
+    rows.append(["HR Result", "1 = HR, 0 = No HR."])
     return clean_rows(rows)
+
 
 def refresh_email_summary(sh, card):
     ws = get_or_create_ws(sh, "Email Summary", 100, 10)
@@ -758,69 +791,26 @@ def odds_bucket(odds):
         return "+1500 to +2499"
     return "+2500+"
 
-def refresh_recommended_bets(sh, card):
-    """
-    Creates a clean recommendation tab so Matt sees the best playable bets only.
-    Keeps all 9 picks in Daily Picks, but this tab filters to stronger grades.
-    """
-    ws = get_or_create_ws(sh, "Recommended Bets", 100, 20)
-    rec = card.copy()
-
-    # Prefer A/B grades, but if there are fewer than 3, show top ValueRank picks.
-    if "ConfidenceGrade" in rec.columns:
-        filtered = rec[rec["ConfidenceGrade"].isin(["A", "B"])].copy()
-    else:
-        filtered = pd.DataFrame()
-
-    if len(filtered) < 3:
-        filtered = rec.sort_values("ValueRank" if "ValueRank" in rec.columns else "Rank").head(5).copy()
-    else:
-        filtered = filtered.sort_values("ValueRank").head(7).copy()
-
+def refresh_hr_targets(sh, card):
+    ws = get_or_create_ws(sh, "HR Targets", 100, 20)
     headers = [
-        "Date","Grade","ValueRank","Tier","Player","Team","Opponent","Opposing Pitcher",
-        "Venue","Score","ValueScore","BestHROdds","AvgHROdds","BooksFound","BestBook","OddsMatchScore","RawHROdds","OddsBook","EdgePct",
-        "WeatherScore","WindImpact","PitcherConfidence","Recommendation"
+        "Date","Rank","Tier","Confidence","Player","Team","Opponent","Opposing Pitcher",
+        "Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%",
+        "PitcherVulnerability","ParkFactor","WeatherScore","WindImpact","Reason"
     ]
-    rows = [["Recommended Bets"], ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")], [], headers]
-
-    for _, r in filtered.iterrows():
-        grade = r.get("ConfidenceGrade", "")
-        if grade == "A":
-            note = "Strong play"
-        elif grade == "B":
-            note = "Playable"
-        else:
-            note = "Watchlist"
+    rows = [["Daily HR Targets"], ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")], [], headers]
+    for _, r in card.sort_values("Rank").iterrows():
         rows.append([
-            TODAY.isoformat(),
-            grade,
-            r.get("ValueRank",""),
-            r.get("Tier",""),
-            r.get("Player",""),
-            r.get("Team",""),
-            r.get("Opponent",""),
-            r.get("Opposing Pitcher",""),
-            r.get("Venue",""),
-            round(float(r.get("Score",0)),2),
-            r.get("ValueScore",""),
-            r.get("BestHROdds",""),
-            r.get("AvgHROdds",""),
-            r.get("BooksFound",""),
-            r.get("BestBook",""),
-            r.get("OddsMatchScore",""),
-            r.get("RawHROdds",""),
-            r.get("OddsBook",""),
-            r.get("EdgePct",""),
-            r.get("WeatherScore",""),
-            r.get("WindImpact",""),
-            r.get("PitcherConfidence",""),
-            note
+            TODAY.isoformat(), int(r.get("Rank",0)), r.get("Tier",""), r.get("ConfidenceLabel",""),
+            r.get("Player",""), r.get("Team",""), r.get("Opponent",""), r.get("Opposing Pitcher",""),
+            r.get("Venue",""), round(float(r.get("Score",0)),2), int(r.get("Season HR",0)), int(r.get("Last7HR",0)),
+            round(float(r.get("HardHit%",0)),2), round(float(r.get("100+MPH%",0)),2), round(float(r.get("FlyBall%",0)),2),
+            round(float(r.get("PitcherVulnerability",0)),2), int(float(r.get("ParkFactor",100))),
+            round(float(r.get("WeatherScore",50)),1), r.get("WindImpact",""), r.get("Reason","")
         ])
-
     ws.clear()
-    ws.update(values=clean_rows(rows), range_name=f"A1:AZ{len(rows)}")
-    print("Recommended Bets updated")
+    ws.update(values=clean_rows(rows), range_name=f"A1:T{len(rows)}")
+    print("HR Targets updated")
 
 
 def ensure_header(ws, headers):
@@ -863,18 +853,17 @@ def write_to_sheet(model, matchups):
     summary_ws = get_or_create_ws(sh, "Scorecard Summary", 100, 12)
 
     card = model[model["Rank"] <= 9].copy()
-    daily_cols = ["Date","Model Version","Tier","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","AvgHROdds","BooksFound","BestBook","OddsMatchScore","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","ValueRank","ConfidenceGrade","OddsStatus","HR Result","Stake","Odds","ProfitLoss"]
+    daily_cols = ["Date","Model Version","Tier","Rank","Group","Confidence","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Reason","HR Result"]
     daily_rows = []
     for _, r in card.iterrows():
-        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("AvgHROdds",""),r.get("BooksFound",""),r.get("BestBook",""),r.get("OddsMatchScore",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("ValueRank",""),r.get("ConfidenceGrade",""),r.get("OddsStatus",""),"","","",""])
-
+        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r.get("ConfidenceLabel",""),r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("Reason",""),""])
     ensure_header(daily_ws, daily_cols)
     daily_ws.append_rows(clean_rows(daily_rows), value_input_option="USER_ENTERED")
 
-    results_cols = ["Date","Model Version","Rank","Group","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","BestHROdds","AvgHROdds","BooksFound","BestBook","OddsMatchScore","RawHROdds","OddsBook","OddsNote","ImpliedProbPct","ModelProbEstPct","EdgePct","ValueScore","ValueRank","ConfidenceGrade","OddsStatus","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score"]
+    results_cols = ["Date","Model Version","Rank","Group","Confidence","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score","Reason"]
     results_rows = []
     for _, r in model.head(30).iterrows():
-        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("BestHROdds",""),r.get("AvgHROdds",""),r.get("BooksFound",""),r.get("BestBook",""),r.get("OddsMatchScore",""),r.get("RawHROdds",""),r.get("OddsBook",""),r.get("OddsNote",""),r.get("ImpliedProbPct",""),r.get("ModelProbEstPct",""),r.get("EdgePct",""),r.get("ValueScore",""),r.get("ValueRank",""),r.get("ConfidenceGrade",""),r.get("OddsStatus",""),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2)])
+        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r.get("ConfidenceLabel",""),r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2),r.get("Reason","")])
     ensure_header(results_ws, results_cols)
     results_ws.append_rows(clean_rows(results_rows), value_input_option="USER_ENTERED")
 
@@ -894,41 +883,33 @@ def write_to_sheet(model, matchups):
         ["Longshot Picks",len(card[card["Tier"]=="Longshot"])],
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
         ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
-        ["Vegas Odds","The Odds API batter_home_runs market; BestHROdds/OddsBook/EdgePct/ValueScore added"],
-        ["ROI Tracking","ROI Dashboard tab added; headers auto-repaired; past-game auto-grading started"],
-        ["Value Ranking","ValueRank and ConfidenceGrade added"],
-        ["Recommended Bets","Recommended Bets tab added"],
-        ["ROI Analytics","ROI Dashboard adds By Odds Range"],
-        ["Email Summary","Email Summary tab upgraded for Matt/app script"],
+        ["Odds/Betting","Removed in V13; model ranks baseball HR targets only"],
+        ["Results Tracking","Manual HR Result remains: 1 = HR, 0 = No HR"],
+        ["Target Ranking","ConfidenceLabel and Reason added"],
+        ["HR Targets","HR Targets tab added"],
+        ["Inactive Filter","Active roster filter added before scoring"],
+        ["Email Summary","Email Summary tab upgraded for clean V13 email"],
         ["Sheet Updated","Yes"],
     ]
     summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
-    refresh_recommended_bets(sh, card)
+    refresh_hr_targets(sh, card)
     refresh_email_summary(sh, card)
-    auto_grade_daily_picks(sh)
-    refresh_roi_dashboard(sh)
     print(f"Updated Google Sheet: {SHEET_NAME}")
     return card
 
 def main():
     model, matchups = build_model()
-    model = add_odds_to_model(model)
-    model = add_value_rank_and_grade(model)
-    # Value-aware rank after odds are added. If no odds are available, ValueScore equals Score.
-    if 'ValueScore' in model.columns:
-        model = model.sort_values('ValueScore', ascending=False).reset_index(drop=True)
-        model['Rank'] = model.index + 1
-        model['Group'] = model['Rank'].apply(lambda x: 'Group 1' if x <= 10 else ('Group 2' if x <= 20 else 'Group 3'))
-        model['Tier'] = model['Rank'].apply(tier_from_rank)
+    model = add_target_rank_and_confidence(model)
     card = write_to_sheet(model, matchups)
-    print("Daily HR Card")
+    print("Daily HR Targets")
     for tier in ["Primary","Secondary","Longshot"]:
         print("")
         print(tier)
         for _, r in card[card["Tier"] == tier].iterrows():
-            print(f"- {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} — Score {round(float(r['Score']),1)} — Odds {r.get('BestHROdds','')} {r.get('OddsBook','')} — Edge {r.get('EdgePct','')} — Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})")
+            print(f"- {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} — Score {round(float(r['Score']),1)} — {r.get('ConfidenceLabel','')} — Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')}) — {r.get('Reason','')}")
 
 if __name__ == "__main__":
     main()
+
 
 
