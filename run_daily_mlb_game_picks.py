@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials
 
 TODAY = date.today()
 YEAR = TODAY.year
-MODEL_VERSION = "Game Picks V2.0 - Stats Only Win Probability"
+MODEL_VERSION = "Game Picks V2.1 - Weighted Stats Logistic Win Probability"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
@@ -263,65 +263,163 @@ def get_team_stats():
     return teams
 
 
-def team_score(team_id, team_stats, pitcher_quality, is_home, env_boost):
+MODEL_WEIGHTS = {
+    "Starting Pitching": 0.40,
+    "Team Offense": 0.25,
+    "Bullpen Strength": 0.15,
+    "Home Field": 0.10,
+    "Weather": 0.05,
+    "Park Factor": 0.05,
+}
+
+
+def clamp(value, low=0, high=100):
+    return max(low, min(high, value))
+
+
+def rate_lower_better(value, average, scale, cap=30):
+    # Converts lower-is-better stats like ERA/WHIP into a 0-100 rating centered at 50.
+    value = safe_float(value, average)
+    return clamp(50 + max(-cap, min(cap, (average - value) * scale)))
+
+
+def rate_higher_better(value, average, scale, cap=30):
+    # Converts higher-is-better stats like OPS/RPG/K9 into a 0-100 rating centered at 50.
+    value = safe_float(value, average)
+    return clamp(50 + max(-cap, min(cap, (value - average) * scale)))
+
+
+def pitcher_rating(pitcher_stats):
+    era_score = rate_lower_better(pitcher_stats.get("ERA"), 4.50, 8.0, 28)
+    whip_score = rate_lower_better(pitcher_stats.get("WHIP"), 1.30, 38.0, 26)
+    k9_score = rate_higher_better(pitcher_stats.get("K9"), 8.0, 3.0, 16)
+    rating = era_score * 0.45 + whip_score * 0.40 + k9_score * 0.15
+    return round(clamp(rating), 1)
+
+
+def offense_rating(team_id, team_stats):
     st = team_stats.get(int(team_id), {})
-    win_pct = safe_float(st.get("WinPct"), 0.500)
-    rpg = safe_float(st.get("RunsPerGame"), 4.3)
-    ops = safe_float(st.get("OPS"), 0.700)
-    team_era = safe_float(st.get("TeamERA"), 4.50)
-    team_whip = safe_float(st.get("TeamWHIP"), 1.30)
-    score = 50
-    score += (win_pct - 0.500) * 55
-    score += (rpg - 4.3) * 5.5
-    score += (ops - 0.700) * 70
-    score += (4.50 - team_era) * 2.8
-    score += (1.30 - team_whip) * 9
-    score += (pitcher_quality - 50) * 0.60
-    if is_home:
-        score += 3.5
-    score += env_boost
-    return round(max(0, min(100, score)), 1)
+    rpg_score = rate_higher_better(st.get("RunsPerGame"), 4.30, 6.5, 30)
+    ops_score = rate_higher_better(st.get("OPS"), 0.700, 95.0, 30)
+    win_profile = rate_higher_better(st.get("WinPct"), 0.500, 70.0, 18)
+    rating = rpg_score * 0.45 + ops_score * 0.40 + win_profile * 0.15
+    return round(clamp(rating), 1)
+
+
+def bullpen_rating(team_id, team_stats):
+    # Temporary bullpen proxy using overall team pitching until true bullpen stats are added.
+    st = team_stats.get(int(team_id), {})
+    era_score = rate_lower_better(st.get("TeamERA"), 4.50, 4.5, 24)
+    whip_score = rate_lower_better(st.get("TeamWHIP"), 1.30, 25.0, 24)
+    rating = era_score * 0.55 + whip_score * 0.45
+    return round(clamp(rating), 1)
+
+
+def home_field_rating(is_home):
+    return 60.0 if is_home else 50.0
+
+
+def weather_rating(row):
+    wx = safe_float(row.get("WeatherScore"), 50)
+    wind = str(row.get("WindImpact", ""))
+    rating = 50 + (wx - 50) * 0.45
+    if wind in ["Out", "Cross/Out"]:
+        rating += 3
+    elif wind in ["In", "Cross/In"]:
+        rating -= 3
+    return round(clamp(rating), 1)
+
+
+def park_rating(row):
+    park = safe_float(row.get("ParkFactor"), 100)
+    return round(clamp(50 + (park - 100) * 0.75), 1)
+
+
+def team_components(team_id, team_stats, pitcher_stats, is_home, row):
+    components = {
+        "Pitching Rating": pitcher_rating(pitcher_stats),
+        "Offense Rating": offense_rating(team_id, team_stats),
+        "Bullpen Rating": bullpen_rating(team_id, team_stats),
+        "Home Field Rating": home_field_rating(is_home),
+        "Weather Rating": weather_rating(row),
+        "Park Rating": park_rating(row),
+    }
+    strength = (
+        components["Pitching Rating"] * MODEL_WEIGHTS["Starting Pitching"] +
+        components["Offense Rating"] * MODEL_WEIGHTS["Team Offense"] +
+        components["Bullpen Rating"] * MODEL_WEIGHTS["Bullpen Strength"] +
+        components["Home Field Rating"] * MODEL_WEIGHTS["Home Field"] +
+        components["Weather Rating"] * MODEL_WEIGHTS["Weather"] +
+        components["Park Rating"] * MODEL_WEIGHTS["Park Factor"]
+    )
+    components["Weighted Team Strength"] = round(clamp(strength), 1)
+    return components
 
 
 def win_probability_from_edge(edge):
-    # Conservative logistic curve: edge 0 = 50%, edge 20 ~= 73%, edge 40 ~= 88%.
-    e = max(-50, min(50, float(edge)))
-    prob = 1 / (1 + math.exp(-e / 16.0))
+    # Calibrated logistic curve for weighted ratings. Edge 0 = 50%, 6 ~= 60%, 12 ~= 69%, 20 ~= 79%.
+    e = max(-35, min(35, float(edge)))
+    prob = 1 / (1 + math.exp(-e / 14.5))
     return round(prob * 100, 1)
+
+
+def upset_risk(prob, edge, expected_margin):
+    p = safe_float(prob, 50)
+    e = abs(safe_float(edge, 0))
+    margin = abs(safe_float(expected_margin, 0))
+    if p < 56 or e < 4 or margin < 0.4:
+        return "High"
+    if p < 62 or e < 8 or margin < 0.8:
+        return "Medium"
+    if p < 70 or e < 14 or margin < 1.4:
+        return "Moderate"
+    return "Low"
 
 
 def confidence_from_prob(prob):
     p = float(prob)
     if p >= 78:
         return "★★★★★ Elite Pick"
-    if p >= 68:
+    if p >= 70:
         return "★★★★ Strong Pick"
-    if p >= 60:
+    if p >= 62:
         return "★★★ Solid Pick"
-    if p >= 55:
+    if p >= 56:
         return "★★ Lean"
     return "★ Pass"
 
 
+def confidence_score(prob, edge, expected_margin):
+    p = safe_float(prob, 50)
+    e = abs(safe_float(edge, 0))
+    m = abs(safe_float(expected_margin, 0))
+    score = (p - 50) * 1.6 + e * 1.1 + m * 4.5
+    return round(clamp(score, 0, 100), 1)
+
+
 def margin_from_edge(edge):
     e = abs(float(edge))
-    if e >= 20:
+    if e >= 18:
         return "Projected 2+ run edge"
-    if e >= 12:
+    if e >= 11:
         return "Projected 1-2 run edge"
-    if e >= 6:
+    if e >= 5:
         return "Small projected edge"
     return "No clear run-margin edge"
 
 
-def projected_team_runs(team_model_score, opponent_pitcher_quality, weather_score, park):
-    # Stats-only run estimate. Not meant as exact betting total; used for relative game context.
+def projected_team_runs(team_components, opponent_components, weather_score, park):
+    # V2.1 run projection uses offense versus opposing starter/bullpen plus park/weather context.
+    offense = safe_float(team_components.get("Offense Rating"), 50)
+    opp_pitch = safe_float(opponent_components.get("Pitching Rating"), 50)
+    opp_bullpen = safe_float(opponent_components.get("Bullpen Rating"), 50)
     runs = 4.35
-    runs += (team_model_score - 50) * 0.055
-    runs += (50 - opponent_pitcher_quality) * 0.035
-    runs += (safe_float(weather_score, 50) - 50) * 0.025
-    runs += (safe_float(park, 100) - 100) * 0.035
-    return round(max(1.5, min(9.5, runs)), 1)
+    runs += (offense - 50) * 0.040
+    runs += (50 - opp_pitch) * 0.030
+    runs += (50 - opp_bullpen) * 0.018
+    runs += (safe_float(weather_score, 50) - 50) * 0.020
+    runs += (safe_float(park, 100) - 100) * 0.030
+    return round(max(1.8, min(8.8, runs)), 1)
 
 
 def build_schedule_games():
@@ -358,27 +456,32 @@ def environment_edge(row):
 def build_why(row):
     pieces = []
     pick = row.get("Projected Winner Name", row.get("Projected Winner", ""))
-    opp = row.get("Opponent", "")
-    pitcher_edge = safe_float(row.get("Pitcher Edge"), 0)
-    if pitcher_edge >= 12:
-        pieces.append(f"{pick} owns a major starting pitching advantage.")
-    elif pitcher_edge >= 6:
-        pieces.append(f"{pick} has the better starting pitcher profile today.")
-    elif pitcher_edge <= -6:
-        pieces.append(f"{pick} is supported more by team strength than the starting pitching matchup.")
+    pitcher_edge = safe_float(row.get("Pitching Advantage"), 0)
+    offense_edge = safe_float(row.get("Offensive Advantage"), 0)
+    bullpen_edge = safe_float(row.get("Bullpen Advantage"), 0)
+    if pitcher_edge >= 10:
+        pieces.append(f"{pick} owns the clearest starting pitching edge in this matchup.")
+    elif pitcher_edge >= 5:
+        pieces.append(f"{pick} gets a meaningful starting pitching advantage.")
+    elif pitcher_edge <= -5:
+        pieces.append(f"{pick} is overcoming a starting pitching disadvantage with the broader team profile.")
     else:
-        pieces.append("The starting pitching matchup is relatively balanced.")
-    if safe_float(row.get("Win Probability", 50), 50) >= 70:
-        pieces.append("The overall model profile creates one of the stronger projected winner spots on the slate.")
-    elif safe_float(row.get("Win Probability", 50), 50) >= 60:
-        pieces.append("The model sees a solid statistical edge, but not a runaway advantage.")
-    else:
-        pieces.append("This projects closer to a lean than a high-confidence selection.")
+        pieces.append("The starting pitching matchup grades close to even.")
+    if offense_edge >= 6:
+        pieces.append("The offensive profile gives the pick a real run-creation advantage.")
+    elif offense_edge <= -6:
+        pieces.append("The pick is not driven by offense; pitching and total team strength are carrying the grade.")
+    if bullpen_edge >= 6:
+        pieces.append("Bullpen support also tilts toward the projected winner.")
+    risk = row.get("Upset Risk", "")
+    if risk in ["High", "Medium"]:
+        pieces.append(f"Upset risk is {risk.lower()}, so this profiles more like a controlled lean than a lock.")
+    elif safe_float(row.get("Win Probability", 50), 50) >= 70:
+        pieces.append("The calibrated probability supports one of the stronger positions on the slate.")
     wind = str(row.get("WindImpact", ""))
     venue = row.get("Venue", "")
-    temp = safe_float(row.get("TempF"), 0)
     if wind in ["Out", "Cross/Out"]:
-        pieces.append(f"Run environment gets a boost with wind {wind.lower()} at {venue}.")
+        pieces.append(f"The run environment gets a boost with wind {wind.lower()} at {venue}.")
     elif wind in ["In", "Cross/In"]:
         pieces.append(f"Weather may suppress scoring with wind {wind.lower()} at {venue}.")
     elif wind == "Dome":
@@ -395,26 +498,68 @@ def build_game_model():
     for _, g in games.iterrows():
         away_pitch = get_pitcher_stats(g["AwayPitcherID"])
         home_pitch = get_pitcher_stats(g["HomePitcherID"])
-        env = environment_edge(g)
-        away_score = team_score(g["AwayTeamID"], team_stats, away_pitch["PitcherQuality"], False, env)
-        home_score = team_score(g["HomeTeamID"], team_stats, home_pitch["PitcherQuality"], True, env)
-        away_runs = projected_team_runs(away_score, home_pitch["PitcherQuality"], g["WeatherScore"], g["ParkFactor"])
-        home_runs = projected_team_runs(home_score, away_pitch["PitcherQuality"], g["WeatherScore"], g["ParkFactor"])
-        if home_score >= away_score:
+        away_comp = team_components(g["AwayTeamID"], team_stats, away_pitch, False, g)
+        home_comp = team_components(g["HomeTeamID"], team_stats, home_pitch, True, g)
+        away_strength = away_comp["Weighted Team Strength"]
+        home_strength = home_comp["Weighted Team Strength"]
+        away_runs = projected_team_runs(away_comp, home_comp, g["WeatherScore"], g["ParkFactor"])
+        home_runs = projected_team_runs(home_comp, away_comp, g["WeatherScore"], g["ParkFactor"])
+        if home_strength >= away_strength:
             pick_team, pick_name, fade_team = g["HomeTeam"], g["HomeTeamName"], g["AwayTeam"]
-            edge = round(home_score - away_score, 1)
-            pitcher_edge = round(home_pitch["PitcherQuality"] - away_pitch["PitcherQuality"], 1)
+            edge = round(home_strength - away_strength, 1)
+            pitcher_edge = round(home_comp["Pitching Rating"] - away_comp["Pitching Rating"], 1)
+            offense_edge = round(home_comp["Offense Rating"] - away_comp["Offense Rating"], 1)
+            bullpen_edge = round(home_comp["Bullpen Rating"] - away_comp["Bullpen Rating"], 1)
             expected_margin = round(home_runs - away_runs, 1)
         else:
             pick_team, pick_name, fade_team = g["AwayTeam"], g["AwayTeamName"], g["HomeTeam"]
-            edge = round(away_score - home_score, 1)
-            pitcher_edge = round(away_pitch["PitcherQuality"] - home_pitch["PitcherQuality"], 1)
+            edge = round(away_strength - home_strength, 1)
+            pitcher_edge = round(away_comp["Pitching Rating"] - home_comp["Pitching Rating"], 1)
+            offense_edge = round(away_comp["Offense Rating"] - home_comp["Offense Rating"], 1)
+            bullpen_edge = round(away_comp["Bullpen Rating"] - home_comp["Bullpen Rating"], 1)
             expected_margin = round(away_runs - home_runs, 1)
         win_prob = win_probability_from_edge(edge)
-        row = {"Date": TODAY.isoformat(), "Model Version": MODEL_VERSION, "Game": f"{g['AwayTeam']} @ {g['HomeTeam']}", "Venue": g["Venue"], "Projected Winner": pick_team, "Projected Winner Name": pick_name, "Opponent": fade_team, "Confidence": confidence_from_prob(win_prob), "Win Probability": win_prob, "Model Edge": edge, "Run Margin Lean": margin_from_edge(edge), "Expected Margin": expected_margin, "Away Projected Runs": away_runs, "Home Projected Runs": home_runs, "Away Score": away_score, "Home Score": home_score, "Away Team": g["AwayTeam"], "Home Team": g["HomeTeam"], "Away Pitcher": g["AwayPitcher"], "Home Pitcher": g["HomePitcher"], "Away Pitcher Quality": away_pitch["PitcherQuality"], "Home Pitcher Quality": home_pitch["PitcherQuality"], "Pitcher Edge": pitcher_edge, "WeatherScore": g["WeatherScore"], "WindImpact": g["WindImpact"], "TempF": g["TempF"], "ParkFactor": g["ParkFactor"], "Verified": "Yes" if g["AwayPitcherID"] and g["HomePitcherID"] and g["Venue"] else "Partial"}
+        risk = upset_risk(win_prob, edge, expected_margin)
+        c_score = confidence_score(win_prob, edge, expected_margin)
+        row = {
+            "Date": TODAY.isoformat(), "Model Version": MODEL_VERSION,
+            "Game": f"{g['AwayTeam']} @ {g['HomeTeam']}", "Venue": g["Venue"],
+            "Projected Winner": pick_team, "Projected Winner Name": pick_name, "Opponent": fade_team,
+            "Confidence": confidence_from_prob(win_prob), "Confidence Score": c_score,
+            "Win Probability": win_prob, "Model Edge": edge, "Upset Risk": risk,
+            "Run Margin Lean": margin_from_edge(edge), "Expected Margin": expected_margin,
+            "Away Projected Runs": away_runs, "Home Projected Runs": home_runs,
+            "Away Score": away_strength, "Home Score": home_strength,
+            "Away Team Strength": away_strength, "Home Team Strength": home_strength,
+            "Away Team": g["AwayTeam"], "Home Team": g["HomeTeam"],
+            "Away Pitcher": g["AwayPitcher"], "Home Pitcher": g["HomePitcher"],
+            "Away Pitcher Quality": away_pitch["PitcherQuality"], "Home Pitcher Quality": home_pitch["PitcherQuality"],
+            "Away Pitching Rating": away_comp["Pitching Rating"], "Home Pitching Rating": home_comp["Pitching Rating"],
+            "Away Offense Rating": away_comp["Offense Rating"], "Home Offense Rating": home_comp["Offense Rating"],
+            "Away Bullpen Rating": away_comp["Bullpen Rating"], "Home Bullpen Rating": home_comp["Bullpen Rating"],
+            "Pitcher Edge": pitcher_edge, "Pitching Advantage": pitcher_edge,
+            "Offensive Advantage": offense_edge, "Bullpen Advantage": bullpen_edge,
+            "WeatherScore": g["WeatherScore"], "WindImpact": g["WindImpact"], "TempF": g["TempF"], "ParkFactor": g["ParkFactor"],
+            "Verified": "Yes" if g["AwayPitcherID"] and g["HomePitcherID"] and g["Venue"] else "Partial"
+        }
         row["Why"] = build_why(row)
         rows.append(row)
-        debug.append({**g.to_dict(), "AwayERA": away_pitch["ERA"], "AwayWHIP": away_pitch["WHIP"], "AwayK9": away_pitch["K9"], "HomeERA": home_pitch["ERA"], "HomeWHIP": home_pitch["WHIP"], "HomeK9": home_pitch["K9"], "AwayPitcherQuality": away_pitch["PitcherQuality"], "HomePitcherQuality": home_pitch["PitcherQuality"], "AwayModelScore": away_score, "HomeModelScore": home_score, "AwayProjectedRuns": away_runs, "HomeProjectedRuns": home_runs})
+        debug.append({
+            **g.to_dict(),
+            "AwayERA": away_pitch["ERA"], "AwayWHIP": away_pitch["WHIP"], "AwayK9": away_pitch["K9"],
+            "HomeERA": home_pitch["ERA"], "HomeWHIP": home_pitch["WHIP"], "HomeK9": home_pitch["K9"],
+            "AwayPitcherQualityRaw": away_pitch["PitcherQuality"], "HomePitcherQualityRaw": home_pitch["PitcherQuality"],
+            "AwayPitchingRating": away_comp["Pitching Rating"], "HomePitchingRating": home_comp["Pitching Rating"],
+            "AwayOffenseRating": away_comp["Offense Rating"], "HomeOffenseRating": home_comp["Offense Rating"],
+            "AwayBullpenRating": away_comp["Bullpen Rating"], "HomeBullpenRating": home_comp["Bullpen Rating"],
+            "AwayHomeFieldRating": away_comp["Home Field Rating"], "HomeHomeFieldRating": home_comp["Home Field Rating"],
+            "AwayWeatherRating": away_comp["Weather Rating"], "HomeWeatherRating": home_comp["Weather Rating"],
+            "AwayParkRating": away_comp["Park Rating"], "HomeParkRating": home_comp["Park Rating"],
+            "AwayWeightedTeamStrength": away_strength, "HomeWeightedTeamStrength": home_strength,
+            "ModelEdge": edge, "WinProbability": win_prob, "UpsetRisk": risk,
+            "AwayProjectedRuns": away_runs, "HomeProjectedRuns": home_runs,
+            "Weights": json.dumps(MODEL_WEIGHTS)
+        })
     picks = pd.DataFrame(rows).sort_values("Win Probability", ascending=False).reset_index(drop=True)
     picks["Rank"] = picks.index + 1
     return picks, pd.DataFrame(debug)
@@ -432,7 +577,7 @@ def build_email_rows(picks):
         [],
         ["Daily Outlook"],
         ["Games Evaluated", len(picks)],
-        ["Best Overall Pick", f"{top['Projected Winner']} over {top['Opponent']} - {top['Confidence']} ({top['Win Probability']}%)"],
+        ["Best Overall Pick", f"{top['Projected Winner']} over {top['Opponent']} - {top['Confidence']} ({top['Win Probability']}%) | Upset Risk: {top['Upset Risk']}"],
         ["Best Run Margin Lean", f"{top['Projected Winner']} - {top['Run Margin Lean']} | Expected Margin {top['Expected Margin']}"],
         ["Highest Projected Scoring Game", f"{highest_total['Game']} - {highest_total['Total Runs']:.1f} projected runs"],
         ["Note", "Stats-only model. No sportsbook odds, betting edge, or lines used."],
@@ -444,6 +589,9 @@ def build_email_rows(picks):
         rows.append(["Win Probability", f"{r['Win Probability']}%"])
         rows.append(["Projected Score", f"{r['Away Team']} {r['Away Projected Runs']} - {r['Home Team']} {r['Home Projected Runs']}"])
         rows.append(["Expected Margin", f"{r['Expected Margin']} runs"])
+        rows.append(["Upset Risk", r["Upset Risk"]])
+        rows.append(["Strength Edge", f"{r['Model Edge']} rating points | Confidence Score {r['Confidence Score']}"])
+        rows.append(["Component Edge", f"Pitching {r['Pitching Advantage']} | Offense {r['Offensive Advantage']} | Bullpen {r['Bullpen Advantage']}"])
         rows.append(["Run Margin Lean", r["Run Margin Lean"]])
         rows.append(["Why Today", r["Why"]])
         rows.append(["Pitchers", f"{r['Away Team']}: {r['Away Pitcher']} | {r['Home Team']}: {r['Home Pitcher']}"])
@@ -452,7 +600,7 @@ def build_email_rows(picks):
         rows.append([])
     rows.extend([
         ["Model Notes"],
-        ["Ranking Basis", "Starting pitcher quality, team offense, team pitching profile, win profile, home field, park and weather."],
+        ["Ranking Basis", "Weighted model: Starting Pitching 40%, Offense 25%, Bullpen 15%, Home Field 10%, Weather 5%, Park Factor 5%."],
         ["Odds/Betting", "Removed. This model uses stats only."],
         ["Results Tracking", "Game Result can be entered manually after games finish."],
     ])
@@ -469,16 +617,16 @@ def write_to_sheet(picks, debug):
     debug_ws = get_or_create_ws(sh, "Game Model Debug", 1000, 65)
     results_ws = get_or_create_ws(sh, "Game Results", 1000, 20)
     email_ws = get_or_create_ws(sh, "Game Email Summary", 150, 10)
-    game_cols = ["Date","Model Version","Rank","Game","Venue","Projected Winner","Projected Winner Name","Opponent","Confidence","Win Probability","Model Edge","Run Margin Lean","Expected Margin","Away Projected Runs","Home Projected Runs","Away Score","Home Score","Away Team","Home Team","Away Pitcher","Home Pitcher","Away Pitcher Quality","Home Pitcher Quality","Pitcher Edge","WeatherScore","WindImpact","TempF","ParkFactor","Why","Verified","Game Result"]
+    game_cols = ["Date","Model Version","Rank","Game","Venue","Projected Winner","Projected Winner Name","Opponent","Confidence","Confidence Score","Win Probability","Model Edge","Upset Risk","Run Margin Lean","Expected Margin","Away Projected Runs","Home Projected Runs","Away Score","Home Score","Away Team Strength","Home Team Strength","Away Team","Home Team","Away Pitcher","Home Pitcher","Away Pitcher Quality","Home Pitcher Quality","Away Pitching Rating","Home Pitching Rating","Away Offense Rating","Home Offense Rating","Away Bullpen Rating","Home Bullpen Rating","Pitching Advantage","Offensive Advantage","Bullpen Advantage","WeatherScore","WindImpact","TempF","ParkFactor","Why","Verified","Game Result"]
     game_rows = []
     for _, r in picks.iterrows():
         game_rows.append([r.get(c,"") for c in game_cols[:-1]] + [""])
     game_ws.clear()
-    game_ws.update(values=clean_rows([game_cols] + game_rows), range_name=f"A1:AE{len(game_rows)+1}")
+    game_ws.update(values=clean_rows([game_cols] + game_rows), range_name=f"A1:AQ{len(game_rows)+1}")
     debug_cols = list(debug.columns)
     debug_rows = debug[debug_cols].fillna("").values.tolist()
     debug_ws.clear()
-    debug_ws.update(values=clean_rows([debug_cols] + debug_rows), range_name=f"A1:BM{len(debug_rows)+1}")
+    debug_ws.update(values=clean_rows([debug_cols] + debug_rows), range_name=f"A1:BZ{len(debug_rows)+1}")
     results_headers = ["Date","Game","Projected Winner","Confidence","Win Probability","Expected Margin","Actual Winner","Correct?","Final Score","Notes"]
     if not results_ws.get_all_values():
         results_ws.update(values=[results_headers], range_name="A1:J1")
@@ -495,7 +643,7 @@ def main():
     write_to_sheet(picks, debug)
     print("Top Game Picks")
     for _, r in picks.head(7).iterrows():
-        print(f"- {r['Projected Winner']} over {r['Opponent']} | {r['Confidence']} | Win Prob {r['Win Probability']}% | {r['Run Margin Lean']}")
+        print(f"- {r['Projected Winner']} over {r['Opponent']} | {r['Confidence']} | Win Prob {r['Win Probability']}% | Upset {r['Upset Risk']} | {r['Run Margin Lean']}")
 
 
 if __name__ == "__main__":
