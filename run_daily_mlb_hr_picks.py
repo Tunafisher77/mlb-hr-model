@@ -11,7 +11,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V14.1 - Better Why Notes + Game Integrity"
+MODEL_VERSION = "Automated V15 - Professional Scouting Report"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -910,9 +910,122 @@ def add_target_rank_and_confidence(model):
     return model
 
 
+def scouting_stars(label):
+    label = str(label or "")
+    if label == "Elite Target":
+        return "★★★★★"
+    if label == "Strong Target":
+        return "★★★★☆"
+    if label == "Solid Target":
+        return "★★★☆☆"
+    if label == "Watchlist":
+        return "★★☆☆☆"
+    return "★☆☆☆☆"
+
+
+def format_env_line(r):
+    venue = r.get("Venue", "")
+    temp = r.get("TempF", "")
+    wind_mph = r.get("WindMPH", "")
+    wind = r.get("WindImpact", "")
+    weather = r.get("WeatherScore", "")
+    dome = str(r.get("Dome", "") or "").lower() == "true"
+    park = r.get("ParkFactor", "")
+
+    parts = []
+    if venue:
+        parts.append(str(venue))
+    if dome:
+        parts.append("Dome / controlled conditions")
+    else:
+        try:
+            parts.append(f"{float(temp):.0f}°F")
+        except Exception:
+            pass
+        try:
+            parts.append(f"wind {float(wind_mph):.1f} mph {wind}")
+        except Exception:
+            if wind:
+                parts.append(f"wind {wind}")
+    try:
+        parts.append(f"WeatherScore {float(weather):.1f}")
+    except Exception:
+        pass
+    try:
+        parts.append(f"ParkFactor {int(round(float(park)))}")
+    except Exception:
+        pass
+    return " | ".join([p for p in parts if p])
+
+
+def format_power_line(r):
+    bits = []
+    try:
+        bits.append(f"Season HR: {int(float(r.get('Season HR', 0) or 0))}")
+    except Exception:
+        pass
+    try:
+        bits.append(f"Recent HR: {int(float(r.get('Last7HR', 0) or 0))}")
+    except Exception:
+        pass
+    try:
+        bits.append(f"HardHit: {float(r.get('HardHit%', 0) or 0):.1f}%")
+    except Exception:
+        pass
+    try:
+        bits.append(f"100+ MPH: {float(r.get('100+MPH%', 0) or 0):.1f}%")
+    except Exception:
+        pass
+    try:
+        bits.append(f"FlyBall: {float(r.get('FlyBall%', 0) or 0):.1f}%")
+    except Exception:
+        pass
+    return " | ".join(bits)
+
+
+def format_pitcher_line(r):
+    pitcher = r.get("Opposing Pitcher", "")
+    bits = [str(pitcher)] if pitcher else []
+    try:
+        bits.append(f"ERA {float(r.get('ERA', 0) or 0):.2f}")
+    except Exception:
+        pass
+    try:
+        bits.append(f"WHIP {float(r.get('WHIP', 0) or 0):.2f}")
+    except Exception:
+        pass
+    try:
+        bits.append(f"K/9 {float(r.get('K9', 0) or 0):.1f}")
+    except Exception:
+        pass
+    try:
+        bits.append(f"PitcherVulnerability {float(r.get('PitcherVulnerability', 0) or 0):.1f}")
+    except Exception:
+        pass
+    return " | ".join(bits)
+
+
+def add_player_report_rows(rows, r):
+    rank = int(r.get("Rank", 0))
+    label = r.get("ConfidenceLabel", "")
+    stars = scouting_stars(label)
+    score = round(float(r.get("Score", 0)), 1)
+    player = r.get("Player", "")
+    team = r.get("Team", "")
+    opp = r.get("Opponent", "")
+
+    rows.append([f"{rank}. {stars} {label}", f"{player} ({team}) vs {opp} | Score {score}"])
+    rows.append(["Matchup", format_pitcher_line(r)])
+    rows.append(["Environment", format_env_line(r)])
+    rows.append(["Power Profile", format_power_line(r)])
+    rows.append(["Why Today", r.get("Reason", "")])
+    rows.append(["Verification", "Game, opponent, venue, probable pitcher, and weather verified by the schedule engine."])
+    rows.append([])
+
+
 def build_email_summary_rows(card):
     rows = []
-    rows.append(["Daily MLB HR Targets Email Summary"])
+    rows.append(["Daily MLB HR Targets - Professional Scouting Report"])
     rows.append(["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
     rows.append(["Model Version", MODEL_VERSION])
     rows.append([])
@@ -920,32 +1033,22 @@ def build_email_summary_rows(card):
     rows.append(["Top HR Targets"])
     top = card.sort_values("Rank").head(5)
     for _, r in top.iterrows():
-        rows.append([
-            int(r.get("Rank", 0)),
-            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | {r.get('Venue','')} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
-        ])
-        rows.append(["", f"Why: {r.get('Reason','')}"])
+        add_player_report_rows(rows, r)
 
-    rows.append([])
     rows.append(["Watchlist"])
     watch = card.sort_values("Rank").iloc[5:9]
     for _, r in watch.iterrows():
-        rows.append([
-            int(r.get("Rank", 0)),
-            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | {r.get('Venue','')} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
-        ])
-        rows.append(["", f"Why: {r.get('Reason','')}"])
+        add_player_report_rows(rows, r)
 
-    rows.append([])
     rows.append(["Model Notes"])
     rows.append(["Ranking Basis", "Season power, recent HR form, hard-hit contact, 100+ MPH contact, fly-ball profile, pitcher vulnerability, park factor, and weather/wind."])
-    rows.append(["Game Integrity", "Every target is tied to a verified scheduled game, venue, opposing pitcher, and weather record."])
+    rows.append(["Game Integrity", "Every target is tied to a verified scheduled game, venue, opposing pitcher, and weather record before ranking."])
     rows.append(["Inactive Player Filter", "Players not on active rosters are removed before scoring."])
+    rows.append(["Report Style", "V15 keeps the ranking engine stable and upgrades the report into a scouting-style format."])
     rows.append([])
     rows.append(["Results Tracking"])
     rows.append(["HR Result", "1 = HR, 0 = No HR."])
     return clean_rows(rows)
-
 
 def refresh_email_summary(sh, card):
     ws = get_or_create_ws(sh, "Email Summary", 100, 10)
