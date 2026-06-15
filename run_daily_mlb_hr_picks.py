@@ -11,7 +11,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V13.1 - Confidence Labels + Clean HR Targets"
+MODEL_VERSION = "Automated V14 - Game Integrity + Verified HR Targets"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -294,12 +294,142 @@ def build_reason_text(row):
     return "; ".join(parts)
 
 def build_model():
-    d = requests.get("https://statsapi.mlb.com/api/v1/stats", params={"stats":"season","group":"hitting","playerPool":"ALL","sortStat":"homeRuns","limit":30,"season":YEAR,"hydrate":"team"}, timeout=30).json()
+    """
+    V14 Game Integrity Engine.
+    The game schedule is the source of truth. We build today's official games first,
+    then attach hitters to their team ID so opponent, venue, opposing pitcher, and weather
+    all come from the same verified game record.
+    """
+    sched = requests.get(
+        "https://statsapi.mlb.com/api/v1/schedule",
+        params={"sportId": 1, "date": TODAY.isoformat(), "hydrate": "probablePitcher,team"},
+        timeout=30
+    ).json()
+
+    matchups = []
+    todays_team_ids = []
+    for day in sched.get("dates", []):
+        for g in day.get("games", []):
+            game_pk = g.get("gamePk", "")
+            game_date = g.get("gameDate", "")
+            status = g.get("status", {}).get("detailedState", "")
+            venue = g.get("venue", {}).get("name", "")
+            away_team = g.get("teams", {}).get("away", {}).get("team", {})
+            home_team = g.get("teams", {}).get("home", {}).get("team", {})
+            away_id = away_team.get("id")
+            home_id = home_team.get("id")
+            away = team_abbrev(away_team)
+            home = team_abbrev(home_team)
+            away_name = away_team.get("name", "")
+            home_name = home_team.get("name", "")
+            away_p = g.get("teams", {}).get("away", {}).get("probablePitcher", {}) or {}
+            home_p = g.get("teams", {}).get("home", {}).get("probablePitcher", {}) or {}
+            away_p_name = away_p.get("fullName", "Unknown")
+            away_p_id = away_p.get("id")
+            home_p_name = home_p.get("fullName", "Unknown")
+            home_p_id = home_p.get("id")
+            weather = get_weather_for_venue(venue)
+            base = {
+                "GamePk": game_pk,
+                "GameDateUTC": game_date,
+                "GameStatus": status,
+                "Venue": venue,
+                "ParkFactor": park_factor(venue),
+                "HomeTeam": home,
+                "AwayTeam": away,
+                "HomeTeamName": home_name,
+                "AwayTeamName": away_name,
+                **weather
+            }
+            if away_id:
+                todays_team_ids.append(away_id)
+                verified = bool(home_id and venue and home_p_id)
+                notes = []
+                if not home_id: notes.append("missing opponent team id")
+                if not venue: notes.append("missing venue")
+                if not home_p_id: notes.append("missing opposing probable pitcher")
+                matchups.append({
+                    "Team ID": away_id,
+                    "Team": away,
+                    "Opponent Team ID": home_id,
+                    "Opponent": home,
+                    "HomeAway": "Away",
+                    "Opposing Pitcher": home_p_name,
+                    "Opposing Pitcher ID": home_p_id,
+                    "PitcherSource": pitcher_source_label(home_p_id, home_p_name),
+                    "PitcherConfidence": "High" if home_p_id else "Low",
+                    "MatchupVerified": verified,
+                    "VerificationNotes": "Verified" if verified else "; ".join(notes),
+                    **base
+                })
+            if home_id:
+                todays_team_ids.append(home_id)
+                verified = bool(away_id and venue and away_p_id)
+                notes = []
+                if not away_id: notes.append("missing opponent team id")
+                if not venue: notes.append("missing venue")
+                if not away_p_id: notes.append("missing opposing probable pitcher")
+                matchups.append({
+                    "Team ID": home_id,
+                    "Team": home,
+                    "Opponent Team ID": away_id,
+                    "Opponent": away,
+                    "HomeAway": "Home",
+                    "Opposing Pitcher": away_p_name,
+                    "Opposing Pitcher ID": away_p_id,
+                    "PitcherSource": pitcher_source_label(away_p_id, away_p_name),
+                    "PitcherConfidence": "High" if away_p_id else "Low",
+                    "MatchupVerified": verified,
+                    "VerificationNotes": "Verified" if verified else "; ".join(notes),
+                    **base
+                })
+
+    matchups = pd.DataFrame(matchups)
+    if matchups.empty:
+        raise RuntimeError("No MLB games found for today. Schedule feed returned empty.")
+
+    # Only verified team-game records are allowed into the scoring pool.
+    verified_matchups = matchups[matchups["MatchupVerified"] == True].copy()
+    verified_team_ids = set(pd.to_numeric(verified_matchups["Team ID"], errors="coerce").dropna().astype(int).tolist())
+    print(f"Game integrity: {len(verified_matchups)} verified team-game records out of {len(matchups)}")
+
+    # Pull season HR leaders, but keep only hitters whose current team ID is in a verified game today.
+    d = requests.get(
+        "https://statsapi.mlb.com/api/v1/stats",
+        params={"stats":"season","group":"hitting","playerPool":"ALL","sortStat":"homeRuns","limit":80,"season":YEAR,"hydrate":"team"},
+        timeout=30
+    ).json()
     rows = []
     for s in d.get("stats", [{}])[0].get("splits", []):
-        team = s.get("team", {})
-        rows.append({"Player":s.get("player", {}).get("fullName"),"Player ID":s.get("player", {}).get("id"),"Team":team_abbrev(team),"Team ID":team.get("id"),"Team Name":team.get("name", ""),"Season HR":int(s.get("stat", {}).get("homeRuns", 0) or 0)})
+        team = s.get("team", {}) or {}
+        tid = team.get("id")
+        try:
+            tid_int = int(tid) if tid not in [None, ""] else None
+        except Exception:
+            tid_int = None
+        if tid_int not in verified_team_ids:
+            continue
+        rows.append({
+            "Player": s.get("player", {}).get("fullName"),
+            "Player ID": s.get("player", {}).get("id"),
+            "Team": team_abbrev(team),
+            "Team ID": tid_int,
+            "Team Name": team.get("name", ""),
+            "Season HR": int(s.get("stat", {}).get("homeRuns", 0) or 0)
+        })
     model = pd.DataFrame(rows)
+    if model.empty:
+        raise RuntimeError("No verified hitters found after schedule/team filter.")
+
+    # Active roster filter for the verified teams only.
+    active_ids = fetch_active_roster_player_ids(list(verified_team_ids))
+    if active_ids:
+        before_count = len(model)
+        model["Player ID"] = pd.to_numeric(model["Player ID"], errors="coerce").fillna(0).astype(int)
+        model = model[model["Player ID"].isin(active_ids)].copy()
+        print(f"Active roster filter: {before_count} candidates -> {len(model)} active candidates")
+    else:
+        print("Active roster filter skipped: roster feed unavailable")
 
     out = []
     for _, r in model.iterrows():
@@ -315,56 +445,14 @@ def build_model():
             out.append([r["Player"], 0, 0, 0, 0])
     model = model.merge(pd.DataFrame(out, columns=["Player","HardHit%","100+MPH%","FlyBall%","Last7HR"]), on="Player", how="left")
 
-    sched = requests.get("https://statsapi.mlb.com/api/v1/schedule", params={"sportId":1,"date":TODAY.isoformat(),"hydrate":"probablePitcher,team"}, timeout=30).json()
-    todays_team_ids = []
-    matchups = []
-    for d in sched.get("dates", []):
-        for g in d.get("games", []):
-            away_team = g["teams"]["away"]["team"]
-            home_team = g["teams"]["home"]["team"]
-            todays_team_ids.extend([away_team.get("id"), home_team.get("id")])
-            away = team_abbrev(away_team); home = team_abbrev(home_team)
-            away_p = g["teams"]["away"].get("probablePitcher", {})
-            home_p = g["teams"]["home"].get("probablePitcher", {})
-            venue = g.get("venue", {}).get("name", "")
-            weather = get_weather_for_venue(venue)
-            base = {"Venue":venue, "ParkFactor":park_factor(venue), **weather}
-            home_p_name = home_p.get("fullName", "Unknown")
-            home_p_id = home_p.get("id")
-            away_p_name = away_p.get("fullName", "Unknown")
-            away_p_id = away_p.get("id")
-            matchups.append({
-                "Team":away,"Opponent":home,
-                "Opposing Pitcher":home_p_name,
-                "Opposing Pitcher ID":home_p_id,
-                "PitcherSource":pitcher_source_label(home_p_id, home_p_name),
-                "PitcherConfidence":"High" if home_p_id else "Low",
-                **base
-            })
-            matchups.append({
-                "Team":home,"Opponent":away,
-                "Opposing Pitcher":away_p_name,
-                "Opposing Pitcher ID":away_p_id,
-                "PitcherSource":pitcher_source_label(away_p_id, away_p_name),
-                "PitcherConfidence":"High" if away_p_id else "Low",
-                **base
-            })
-    matchups = pd.DataFrame(matchups)
-
-    # V13 safety filter: only score players on active rosters for teams playing today.
-    active_ids = fetch_active_roster_player_ids(todays_team_ids)
-    if active_ids:
-        before_count = len(model)
-        model["Player ID"] = pd.to_numeric(model["Player ID"], errors="coerce").fillna(0).astype(int)
-        model = model[model["Player ID"].isin(active_ids)].copy()
-        print(f"Active roster filter: {before_count} candidates -> {len(model)} active candidates")
-    else:
-        print("Active roster filter skipped: roster feed unavailable")
-
     pitch_rows = []
-    for pid, pname in matchups[["Opposing Pitcher ID","Opposing Pitcher"]].drop_duplicates().dropna().values:
+    for pid, pname in verified_matchups[["Opposing Pitcher ID","Opposing Pitcher"]].drop_duplicates().dropna().values:
         try:
-            data = requests.get(f"https://statsapi.mlb.com/api/v1/people/{int(pid)}/stats", params={"stats":"season","group":"pitching","season":YEAR}, timeout=20).json()
+            data = requests.get(
+                f"https://statsapi.mlb.com/api/v1/people/{int(pid)}/stats",
+                params={"stats":"season","group":"pitching","season":YEAR},
+                timeout=20
+            ).json()
             splits = data.get("stats", [{}])[0].get("splits", [])
             st = splits[0]["stat"] if splits else {}
             pitch_rows.append({"Opposing Pitcher ID":pid,"ERA":safe_float(st.get("era")),"WHIP":safe_float(st.get("whip")),"K9":safe_float(st.get("strikeoutsPer9Inn"))})
@@ -376,15 +464,18 @@ def build_model():
     else:
         pdf = pd.DataFrame(columns=["Opposing Pitcher ID","ERA","WHIP","K9","PitcherVulnerability"])
 
-    model = model.merge(matchups, on="Team", how="left")
-    model = model.merge(pdf, on="Opposing Pitcher ID", how="left")
-    fallback = pdf["PitcherVulnerability"].mean() if len(pdf) else 50
-    model["PitcherKnown"] = model["Opposing Pitcher ID"].apply(lambda x: bool(str(x).strip()) and str(x).strip().lower() not in ["nan", "none", ""])
-    model["PitcherVulnerability"] = model["PitcherVulnerability"].fillna(fallback)
-    # Unknown pitchers are risky. Keep them in the board, but avoid over-crediting them.
-    model.loc[~model["PitcherKnown"], "PitcherVulnerability"] = 45
+    # Team ID merge prevents abbreviation/name mismatch bugs.
+    model = model.merge(verified_matchups, on=["Team ID"], how="inner", suffixes=("", "_game"))
+    if "Team_game" in model.columns:
+        model["Team"] = model["Team_game"].where(model["Team_game"].astype(str).str.len() > 0, model["Team"])
+        model = model.drop(columns=["Team_game"])
 
-    for c in ["ERA","WHIP","K9"]:
+    model = model.merge(pdf, on="Opposing Pitcher ID", how="left")
+    model["PitcherKnown"] = model["Opposing Pitcher ID"].apply(lambda x: bool(str(x).strip()) and str(x).strip().lower() not in ["nan", "none", ""])
+    model = model[model["MatchupVerified"] == True].copy()
+    model = model[model["PitcherKnown"] == True].copy()
+
+    for c in ["ERA","WHIP","K9","PitcherVulnerability"]:
         model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf,-np.inf],0).fillna(0)
     for c in ["ParkFactor","WeatherScore","TempF","Humidity","WindMPH","WindBoost"]:
         model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf,-np.inf],50).fillna(50)
@@ -392,12 +483,12 @@ def build_model():
     model["Score"] = (
         norm(model["Season HR"]) * 0.07 +
         norm(model["Last7HR"]) * 0.12 +
-        norm(model["HardHit%"]) * 0.16 +
-        norm(model["100+MPH%"]) * 0.12 +
-        norm(model["FlyBall%"]) * 0.08 +
-        norm(model["PitcherVulnerability"]) * 0.19 +
-        norm(model["ParkFactor"]) * 0.07 +
-        norm(model["WeatherScore"]) * 0.19
+        norm(model["HardHit%"] ) * 0.16 +
+        norm(model["100+MPH%"] ) * 0.12 +
+        norm(model["FlyBall%"] ) * 0.08 +
+        norm(model["PitcherVulnerability"] ) * 0.19 +
+        norm(model["ParkFactor"] ) * 0.07 +
+        norm(model["WeatherScore"] ) * 0.19
     )
 
     model = model.replace([np.inf,-np.inf], 0).fillna("")
@@ -406,7 +497,6 @@ def build_model():
     model["Group"] = model["Rank"].apply(lambda x: "Group 1" if x <= 10 else ("Group 2" if x <= 20 else "Group 3"))
     model["Tier"] = model["Rank"].apply(tier_from_rank)
     return model, matchups
-
 
 def normalize_name_for_odds(name):
     return "".join(ch.lower() for ch in str(name) if ch.isalnum())
@@ -747,7 +837,7 @@ def build_email_summary_rows(card):
     for _, r in top.iterrows():
         rows.append([
             int(r.get("Rank", 0)),
-            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
+            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | {r.get('Venue','')} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
         ])
         rows.append(["", f"Why: {r.get('Reason','')}"])
 
@@ -757,13 +847,14 @@ def build_email_summary_rows(card):
     for _, r in watch.iterrows():
         rows.append([
             int(r.get("Rank", 0)),
-            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
+            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | {r.get('Venue','')} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
         ])
         rows.append(["", f"Why: {r.get('Reason','')}"])
 
     rows.append([])
     rows.append(["Model Notes"])
     rows.append(["Ranking Basis", "Season power, recent HR form, hard-hit contact, 100+ MPH contact, fly-ball profile, pitcher vulnerability, park factor, and weather/wind."])
+    rows.append(["Game Integrity", "Every target is tied to a verified scheduled game, venue, opposing pitcher, and weather record."])
     rows.append(["Inactive Player Filter", "Players not on active rosters are removed before scoring."])
     rows.append([])
     rows.append(["Results Tracking"])
@@ -800,7 +891,7 @@ def refresh_hr_targets(sh, card):
     ws = get_or_create_ws(sh, "HR Targets", 100, 20)
     headers = [
         "Date","Rank","Tier","Confidence","Player","Team","Opponent","Opposing Pitcher",
-        "Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%",
+        "Venue","Verified","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%",
         "PitcherVulnerability","ParkFactor","WeatherScore","WindImpact","Reason"
     ]
     rows = [["Daily HR Targets"], ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")], [], headers]
@@ -808,13 +899,13 @@ def refresh_hr_targets(sh, card):
         rows.append([
             TODAY.isoformat(), int(r.get("Rank",0)), r.get("Tier",""), r.get("ConfidenceLabel",""),
             r.get("Player",""), r.get("Team",""), r.get("Opponent",""), r.get("Opposing Pitcher",""),
-            r.get("Venue",""), round(float(r.get("Score",0)),2), int(r.get("Season HR",0)), int(r.get("Last7HR",0)),
+            r.get("Venue",""), r.get("VerificationNotes",""), round(float(r.get("Score",0)),2), int(r.get("Season HR",0)), int(r.get("Last7HR",0)),
             round(float(r.get("HardHit%",0)),2), round(float(r.get("100+MPH%",0)),2), round(float(r.get("FlyBall%",0)),2),
             round(float(r.get("PitcherVulnerability",0)),2), int(float(r.get("ParkFactor",100))),
             round(float(r.get("WeatherScore",50)),1), r.get("WindImpact",""), r.get("Reason","")
         ])
     ws.clear()
-    ws.update(values=clean_rows(rows), range_name=f"A1:T{len(rows)}")
+    ws.update(values=clean_rows(rows), range_name=f"A1:U{len(rows)}")
     print("HR Targets updated")
 
 
@@ -856,19 +947,20 @@ def write_to_sheet(model, matchups):
     results_ws = get_or_create_ws(sh, "Model Results", 1000, 45)
     weather_ws = get_or_create_ws(sh, "Weather Log", 1000, 20)
     summary_ws = get_or_create_ws(sh, "Scorecard Summary", 100, 12)
+    integrity_ws = get_or_create_ws(sh, "Game Integrity Log", 1000, 25)
 
     card = model[model["Rank"] <= 9].copy()
-    daily_cols = ["Date","Model Version","Tier","Rank","Group","Confidence","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Reason","HR Result"]
+    daily_cols = ["Date","Model Version","Tier","Rank","Group","Confidence","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","Venue","Verified","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","PitcherVulnerability","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Reason","HR Result"]
     daily_rows = []
     for _, r in card.iterrows():
-        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r.get("ConfidenceLabel",""),r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("Reason",""),""])
+        daily_rows.append([TODAY.isoformat(),MODEL_VERSION,r["Tier"],int(r["Rank"]),r["Group"],r.get("ConfidenceLabel",""),r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),r["Venue"],r.get("GamePk",""),r.get("HomeAway",""),r.get("MatchupVerified",""),r.get("VerificationNotes",""),round(float(r["Score"]),2),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["PitcherVulnerability"]),2),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),r.get("Reason",""),""])
     ensure_header(daily_ws, daily_cols)
     daily_ws.append_rows(clean_rows(daily_rows), value_input_option="USER_ENTERED")
 
-    results_cols = ["Date","Model Version","Rank","Group","Confidence","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score","Reason"]
+    results_cols = ["Date","Model Version","Rank","Group","Confidence","Player","Team","Opponent","Opposing Pitcher","PitcherSource","PitcherConfidence","ERA","WHIP","K9","PitcherVulnerability","Venue","GamePk","HomeAway","MatchupVerified","VerificationNotes","ParkFactor","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%","Score","Reason"]
     results_rows = []
     for _, r in model.head(30).iterrows():
-        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r.get("ConfidenceLabel",""),r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2),r.get("Reason","")])
+        results_rows.append([TODAY.isoformat(),MODEL_VERSION,int(r["Rank"]),r["Group"],r.get("ConfidenceLabel",""),r["Player"],r["Team"],r["Opponent"],r["Opposing Pitcher"],r.get("PitcherSource",""),r.get("PitcherConfidence",""),round(float(r["ERA"]),2),round(float(r["WHIP"]),2),round(float(r["K9"]),2),round(float(r["PitcherVulnerability"]),2),r["Venue"],r.get("GamePk",""),r.get("HomeAway",""),r.get("MatchupVerified",""),r.get("VerificationNotes",""),int(float(r["ParkFactor"])),round(float(r["TempF"]),1),round(float(r["Humidity"]),1),round(float(r["WindMPH"]),1),r["WindFromDir"],r["WindBlowingTo"],r["WindAngleToCF"],r["WindImpact"],round(float(r["WindBoost"]),1),str(r["Dome"]),round(float(r["WeatherScore"]),1),int(r["Season HR"]),int(r["Last7HR"]),round(float(r["HardHit%"]),2),round(float(r["100+MPH%"]),2),round(float(r["FlyBall%"]),2),round(float(r["Score"]),2),r.get("Reason","")])
     ensure_header(results_ws, results_cols)
     results_ws.append_rows(clean_rows(results_rows), value_input_option="USER_ENTERED")
 
@@ -877,6 +969,20 @@ def write_to_sheet(model, matchups):
     weather_rows = [[TODAY.isoformat(), r["Venue"], r["TempF"], r["Humidity"], r["WindMPH"], r["WindFromDir"], r["WindBlowingTo"], r["WindAngleToCF"], r["WindImpact"], r["WindBoost"], str(r["Dome"]), r["WeatherScore"]] for _, r in weather_log.iterrows()]
     ensure_header(weather_ws, weather_cols)
     weather_ws.append_rows(clean_rows(weather_rows), value_input_option="USER_ENTERED")
+
+
+    integrity_cols = ["Date","Rank","Player","Team","Opponent","HomeAway","HomeTeam","AwayTeam","Venue","GamePk","GameDateUTC","GameStatus","Opposing Pitcher","Opposing Pitcher ID","PitcherSource","PitcherConfidence","MatchupVerified","VerificationNotes","TempF","WindMPH","WindImpact","WeatherScore","Dome"]
+    integrity_rows = []
+    for _, r in model.head(30).iterrows():
+        integrity_rows.append([
+            TODAY.isoformat(), int(r.get("Rank",0)), r.get("Player",""), r.get("Team",""), r.get("Opponent",""), r.get("HomeAway",""),
+            r.get("HomeTeam",""), r.get("AwayTeam",""), r.get("Venue",""), r.get("GamePk",""), r.get("GameDateUTC",""), r.get("GameStatus",""),
+            r.get("Opposing Pitcher",""), r.get("Opposing Pitcher ID",""), r.get("PitcherSource",""), r.get("PitcherConfidence",""),
+            r.get("MatchupVerified",""), r.get("VerificationNotes",""), r.get("TempF",""), r.get("WindMPH",""), r.get("WindImpact",""),
+            r.get("WeatherScore",""), str(r.get("Dome",""))
+        ])
+    ensure_header(integrity_ws, integrity_cols)
+    integrity_ws.append_rows(clean_rows(integrity_rows), value_input_option="USER_ENTERED")
 
     summary_ws.clear()
     summary_rows = [
@@ -887,12 +993,13 @@ def write_to_sheet(model, matchups):
         ["Secondary Picks",len(card[card["Tier"]=="Secondary"])],
         ["Longshot Picks",len(card[card["Tier"]=="Longshot"])],
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
-        ["Pitcher Status","PitcherSource and PitcherConfidence added; unknown pitchers penalized"],
+        ["Pitcher Status","V14 requires verified opposing probable pitcher before scoring"],
         ["Results Tracking","Manual HR Result remains: 1 = HR, 0 = No HR"],
-        ["Target Ranking","V13.1 confidence labels recalibrated: Elite, Strong, Solid, Watchlist, Longshot"],
+        ["Target Ranking","V14 game-integrity verified HR targets with confidence labels"],
         ["HR Targets","HR Targets tab added"],
-        ["Inactive Filter","Active roster filter added before scoring"],
-        ["Email Summary","Email Summary tab upgraded for clean V13 email"],
+        ["Inactive Filter","Active roster filter plus verified game/team merge before scoring"],
+        ["Game Integrity Log","Added to verify player, team, venue, pitcher, and weather binding"],
+        ["Email Summary","Email Summary tab upgraded for clean V14 email"],
         ["Sheet Updated","Yes"],
     ]
     summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
