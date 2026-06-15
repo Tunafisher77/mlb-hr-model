@@ -11,7 +11,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V14 - Game Integrity + Verified HR Targets"
+MODEL_VERSION = "Automated V14.1 - Better Why Notes + Game Integrity"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -273,25 +273,110 @@ def factor_label(value, high=70, low=45):
     return "Neutral"
 
 def build_reason_text(row):
-    parts = []
-    try:
-        if float(row.get("HardHit%", 0) or 0) >= 45:
-            parts.append("strong hard-hit profile")
-        if float(row.get("100+MPH%", 0) or 0) >= 20:
-            parts.append("frequent 100+ MPH contact")
-        if float(row.get("Last7HR", 0) or 0) >= 1:
-            parts.append("recent HR form")
-        if float(row.get("PitcherVulnerability", 0) or 0) >= 65:
-            parts.append("favorable pitcher matchup")
-        if float(row.get("WeatherScore", 50) or 50) >= 65:
-            parts.append(f"favorable weather/wind: {row.get('WindImpact','')}")
-        if float(row.get("ParkFactor", 100) or 100) >= 108:
-            parts.append("HR-friendly park")
-    except Exception:
-        pass
-    if not parts:
-        parts.append("balanced power/matchup profile")
-    return "; ".join(parts)
+    """Build specific, sentence-style explanations for the email.
+    Keeps rankings untouched; only improves the human-readable reason note.
+    """
+    sentences = []
+
+    player = str(row.get("Player", "the hitter") or "the hitter")
+    pitcher = str(row.get("Opposing Pitcher", "the opposing pitcher") or "the opposing pitcher")
+    venue = str(row.get("Venue", "the park") or "the park")
+    wind = str(row.get("WindImpact", "") or "")
+    dome = str(row.get("Dome", "") or "").lower() == "true"
+
+    def fval(col, default=0.0):
+        try:
+            return float(row.get(col, default) or default)
+        except Exception:
+            return default
+
+    last_hr = fval("Last7HR", 0)
+    hard_hit = fval("HardHit%", 0)
+    mph100 = fval("100+MPH%", 0)
+    fly_ball = fval("FlyBall%", 0)
+    pv = fval("PitcherVulnerability", 0)
+    era = fval("ERA", 0)
+    whip = fval("WHIP", 0)
+    k9 = fval("K9", 0)
+    park = fval("ParkFactor", 100)
+    wx = fval("WeatherScore", 50)
+    wind_mph = fval("WindMPH", 0)
+
+    # Pitcher explanation
+    pitcher_bits = []
+    if pv >= 70:
+        pitcher_bits.append("very favorable pitcher profile")
+    elif pv >= 60:
+        pitcher_bits.append("favorable pitcher profile")
+    elif pv >= 50:
+        pitcher_bits.append("manageable pitcher matchup")
+
+    if era >= 4.75:
+        pitcher_bits.append(f"elevated ERA ({era:.2f})")
+    if whip >= 1.35:
+        pitcher_bits.append(f"elevated WHIP ({whip:.2f})")
+    if 0 < k9 <= 7.5:
+        pitcher_bits.append(f"lower strikeout rate ({k9:.1f} K/9)")
+
+    if pitcher_bits:
+        sentences.append(f"Faces {pitcher}, with a {', '.join(pitcher_bits)}.")
+    else:
+        sentences.append(f"Faces {pitcher}; matchup is verified but not a major pitcher boost.")
+
+    # Batted-ball / recent form explanation
+    power_bits = []
+    if last_hr >= 2:
+        power_bits.append(f"coming off {int(last_hr)} HR in the recent Statcast window")
+    elif last_hr >= 1:
+        power_bits.append("coming off a recent HR")
+    if mph100 >= 30:
+        power_bits.append(f"excellent 100+ MPH contact rate ({mph100:.1f}%)")
+    elif mph100 >= 20:
+        power_bits.append(f"frequent 100+ MPH contact ({mph100:.1f}%)")
+    if hard_hit >= 50:
+        power_bits.append(f"strong hard-hit rate ({hard_hit:.1f}%)")
+    if fly_ball >= 45:
+        power_bits.append(f"fly-ball profile ({fly_ball:.1f}%)")
+
+    if power_bits:
+        sentences.append(player + " is " + "; ".join(power_bits) + ".")
+    else:
+        sentences.append(player + " grades more as a matchup/weather target than a recent power-form target.")
+
+    # Park/weather explanation
+    env_bits = []
+    if dome:
+        env_bits.append(f"controlled dome conditions at {venue}")
+    else:
+        if wind in ["Out", "Cross/Out"]:
+            env_bits.append(f"wind is {wind.lower()} at {venue} ({wind_mph:.1f} mph)")
+        elif wind in ["In", "Cross/In"]:
+            env_bits.append(f"wind is working {wind.lower()} at {venue} ({wind_mph:.1f} mph)")
+        elif wind:
+            env_bits.append(f"wind is {wind.lower()} at {venue}")
+        else:
+            env_bits.append(f"weather is tied to {venue}")
+
+    if park >= 110:
+        env_bits.append(f"very HR-friendly park factor ({int(round(park))})")
+    elif park >= 105:
+        env_bits.append(f"positive park factor ({int(round(park))})")
+    elif park <= 95:
+        env_bits.append(f"park factor is less favorable ({int(round(park))})")
+
+    if wx >= 70:
+        env_bits.append(f"strong weather score ({wx:.1f})")
+    elif wx >= 60:
+        env_bits.append(f"positive weather score ({wx:.1f})")
+
+    if env_bits:
+        sentences.append("Environment: " + "; ".join(env_bits) + ".")
+
+    verified = str(row.get("MatchupVerified", row.get("Verified", "")) or "").lower()
+    if verified in ["true", "yes", "1"]:
+        sentences.append("Game, venue, probable pitcher, and weather are verified from the schedule engine.")
+
+    return " ".join(sentences)
 
 def build_model():
     """
