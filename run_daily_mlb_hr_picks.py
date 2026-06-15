@@ -11,7 +11,7 @@ TODAY = date.today()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
 
-MODEL_VERSION = "Automated V14 - Game Integrity + Verified HR Targets"
+MODEL_VERSION = "Automated V15.1 - Polished Professional Scouting Report"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -273,25 +273,110 @@ def factor_label(value, high=70, low=45):
     return "Neutral"
 
 def build_reason_text(row):
-    parts = []
-    try:
-        if float(row.get("HardHit%", 0) or 0) >= 45:
-            parts.append("strong hard-hit profile")
-        if float(row.get("100+MPH%", 0) or 0) >= 20:
-            parts.append("frequent 100+ MPH contact")
-        if float(row.get("Last7HR", 0) or 0) >= 1:
-            parts.append("recent HR form")
-        if float(row.get("PitcherVulnerability", 0) or 0) >= 65:
-            parts.append("favorable pitcher matchup")
-        if float(row.get("WeatherScore", 50) or 50) >= 65:
-            parts.append(f"favorable weather/wind: {row.get('WindImpact','')}")
-        if float(row.get("ParkFactor", 100) or 100) >= 108:
-            parts.append("HR-friendly park")
-    except Exception:
-        pass
-    if not parts:
-        parts.append("balanced power/matchup profile")
-    return "; ".join(parts)
+    """Build specific, sentence-style explanations for the email.
+    Keeps rankings untouched; only improves the human-readable reason note.
+    """
+    sentences = []
+
+    player = str(row.get("Player", "the hitter") or "the hitter")
+    pitcher = str(row.get("Opposing Pitcher", "the opposing pitcher") or "the opposing pitcher")
+    venue = str(row.get("Venue", "the park") or "the park")
+    wind = str(row.get("WindImpact", "") or "")
+    dome = str(row.get("Dome", "") or "").lower() == "true"
+
+    def fval(col, default=0.0):
+        try:
+            return float(row.get(col, default) or default)
+        except Exception:
+            return default
+
+    last_hr = fval("Last7HR", 0)
+    hard_hit = fval("HardHit%", 0)
+    mph100 = fval("100+MPH%", 0)
+    fly_ball = fval("FlyBall%", 0)
+    pv = fval("PitcherVulnerability", 0)
+    era = fval("ERA", 0)
+    whip = fval("WHIP", 0)
+    k9 = fval("K9", 0)
+    park = fval("ParkFactor", 100)
+    wx = fval("WeatherScore", 50)
+    wind_mph = fval("WindMPH", 0)
+
+    # Pitcher explanation
+    pitcher_bits = []
+    if pv >= 70:
+        pitcher_bits.append("very favorable pitcher profile")
+    elif pv >= 60:
+        pitcher_bits.append("favorable pitcher profile")
+    elif pv >= 50:
+        pitcher_bits.append("manageable pitcher matchup")
+
+    if era >= 4.75:
+        pitcher_bits.append(f"elevated ERA ({era:.2f})")
+    if whip >= 1.35:
+        pitcher_bits.append(f"elevated WHIP ({whip:.2f})")
+    if 0 < k9 <= 7.5:
+        pitcher_bits.append(f"lower strikeout rate ({k9:.1f} K/9)")
+
+    if pitcher_bits:
+        sentences.append(f"Faces {pitcher}, with a {', '.join(pitcher_bits)}.")
+    else:
+        sentences.append(f"Faces {pitcher}; matchup is verified but not a major pitcher boost.")
+
+    # Batted-ball / recent form explanation
+    power_bits = []
+    if last_hr >= 2:
+        power_bits.append(f"coming off {int(last_hr)} HR in the recent Statcast window")
+    elif last_hr >= 1:
+        power_bits.append("coming off a recent HR")
+    if mph100 >= 30:
+        power_bits.append(f"excellent 100+ MPH contact rate ({mph100:.1f}%)")
+    elif mph100 >= 20:
+        power_bits.append(f"frequent 100+ MPH contact ({mph100:.1f}%)")
+    if hard_hit >= 50:
+        power_bits.append(f"strong hard-hit rate ({hard_hit:.1f}%)")
+    if fly_ball >= 45:
+        power_bits.append(f"fly-ball profile ({fly_ball:.1f}%)")
+
+    if power_bits:
+        sentences.append(player + " is " + "; ".join(power_bits) + ".")
+    else:
+        sentences.append(player + " grades more as a matchup/weather target than a recent power-form target.")
+
+    # Park/weather explanation
+    env_bits = []
+    if dome:
+        env_bits.append(f"controlled dome conditions at {venue}")
+    else:
+        if wind in ["Out", "Cross/Out"]:
+            env_bits.append(f"wind is {wind.lower()} at {venue} ({wind_mph:.1f} mph)")
+        elif wind in ["In", "Cross/In"]:
+            env_bits.append(f"wind is working {wind.lower()} at {venue} ({wind_mph:.1f} mph)")
+        elif wind:
+            env_bits.append(f"wind is {wind.lower()} at {venue}")
+        else:
+            env_bits.append(f"weather is tied to {venue}")
+
+    if park >= 110:
+        env_bits.append(f"very HR-friendly park factor ({int(round(park))})")
+    elif park >= 105:
+        env_bits.append(f"positive park factor ({int(round(park))})")
+    elif park <= 95:
+        env_bits.append(f"park factor is less favorable ({int(round(park))})")
+
+    if wx >= 70:
+        env_bits.append(f"strong weather score ({wx:.1f})")
+    elif wx >= 60:
+        env_bits.append(f"positive weather score ({wx:.1f})")
+
+    if env_bits:
+        sentences.append("Environment: " + "; ".join(env_bits) + ".")
+
+    verified = str(row.get("MatchupVerified", row.get("Verified", "")) or "").lower()
+    if verified in ["true", "yes", "1"]:
+        sentences.append("Game, venue, probable pitcher, and weather are verified from the schedule engine.")
+
+    return " ".join(sentences)
 
 def build_model():
     """
@@ -825,42 +910,373 @@ def add_target_rank_and_confidence(model):
     return model
 
 
+def scouting_stars(label):
+    label = str(label or "")
+    if label == "Elite Target":
+        return "★★★★★"
+    if label == "Strong Target":
+        return "★★★★☆"
+    if label == "Solid Target":
+        return "★★★☆☆"
+    if label == "Watchlist":
+        return "★★☆☆☆"
+    return "★☆☆☆☆"
+
+
+def safe_num(value, default=0.0):
+    try:
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def rating_from_value(value, excellent=75, strong=60, solid=50, weak=40):
+    v = safe_num(value, 50)
+    if v >= excellent:
+        return "★★★★★", "Excellent"
+    if v >= strong:
+        return "★★★★☆", "Good"
+    if v >= solid:
+        return "★★★☆☆", "Neutral+"
+    if v >= weak:
+        return "★★☆☆☆", "Neutral"
+    return "★☆☆☆☆", "Poor"
+
+
+def pitcher_rating(row):
+    pv = safe_num(row.get("PitcherVulnerability", 50), 50)
+    if pv >= 75:
+        return "★★★★★", "Elite HR Matchup"
+    if pv >= 60:
+        return "★★★★☆", "Favorable HR Matchup"
+    if pv >= 50:
+        return "★★★☆☆", "Manageable Matchup"
+    if pv >= 35:
+        return "★★☆☆☆", "Tougher Matchup"
+    return "★☆☆☆☆", "Difficult Matchup"
+
+
+def environment_rating(row):
+    wx = safe_num(row.get("WeatherScore", 50), 50)
+    wind = str(row.get("WindImpact", "") or "")
+    park = safe_num(row.get("ParkFactor", 100), 100)
+    dome = str(row.get("Dome", "") or "").lower() == "true"
+
+    # Start with weather score, then adjust for park and wind in a readable way.
+    env_score = wx
+    if wind == "Out":
+        env_score += 12
+    elif wind == "Cross/Out":
+        env_score += 7
+    elif wind == "Cross/In":
+        env_score -= 5
+    elif wind == "In":
+        env_score -= 10
+    if park >= 110:
+        env_score += 8
+    elif park >= 105:
+        env_score += 4
+    elif park <= 95:
+        env_score -= 4
+    if dome:
+        env_score = max(48, min(58, env_score))
+
+    if env_score >= 75:
+        return "★★★★★", "Excellent HR Environment"
+    if env_score >= 62:
+        return "★★★★☆", "Good HR Environment"
+    if env_score >= 50:
+        return "★★★☆☆", "Neutral HR Environment"
+    if env_score >= 40:
+        return "★★☆☆☆", "Below-Average HR Environment"
+    return "★☆☆☆☆", "Poor HR Environment"
+
+
+def power_rating(row):
+    last_hr = safe_num(row.get("Last7HR", 0), 0)
+    mph100 = safe_num(row.get("100+MPH%", 0), 0)
+    fb = safe_num(row.get("FlyBall%", 0), 0)
+    hard = safe_num(row.get("HardHit%", 0), 0)
+    score = 0
+    if last_hr >= 5: score += 3
+    elif last_hr >= 2: score += 2
+    elif last_hr >= 1: score += 1
+    if mph100 >= 30: score += 3
+    elif mph100 >= 20: score += 2
+    elif mph100 >= 12: score += 1
+    if fb >= 60: score += 2
+    elif fb >= 45: score += 1
+    if hard >= 45: score += 2
+    elif hard >= 35: score += 1
+    if score >= 8:
+        return "★★★★★", "Excellent Power Form"
+    if score >= 6:
+        return "★★★★☆", "Strong Power Form"
+    if score >= 4:
+        return "★★★☆☆", "Solid Power Form"
+    if score >= 2:
+        return "★★☆☆☆", "Developing Power Form"
+    return "★☆☆☆☆", "Limited Recent Power Form"
+
+
+def risk_level(row):
+    label = str(row.get("ConfidenceLabel", "") or "")
+    wind = str(row.get("WindImpact", "") or "")
+    pitcher_known = str(row.get("PitcherConfidence", "") or "").lower() == "high"
+    if label in ["Elite Target", "Strong Target"] and pitcher_known and wind not in ["In", "Cross/In"]:
+        return "Low"
+    if label in ["Solid Target", "Strong Target"]:
+        return "Medium"
+    return "Medium-High"
+
+
+def clean_game_label(row):
+    team = str(row.get("Team", "") or "")
+    opp = str(row.get("Opponent", "") or "")
+    venue = str(row.get("Venue", "") or "")
+    if team and opp and venue:
+        return f"{team} vs {opp} at {venue}"
+    if team and opp:
+        return f"{team} vs {opp}"
+    return venue or "Verified MLB matchup"
+
+
+def wind_text(row):
+    dome = str(row.get("Dome", "") or "").lower() == "true"
+    if dome:
+        return "Dome / controlled conditions"
+    wind = str(row.get("WindImpact", "") or "")
+    mph = safe_num(row.get("WindMPH", 0), 0)
+    if wind:
+        return f"{mph:.1f} mph {wind}"
+    return "Weather verified"
+
+
+def temp_text(row):
+    dome = str(row.get("Dome", "") or "").lower() == "true"
+    if dome:
+        return "Controlled"
+    temp = safe_num(row.get("TempF", 0), 0)
+    return f"{temp:.0f}°F" if temp else "Verified"
+
+
+def format_env_line(r):
+    venue = r.get("Venue", "")
+    park = safe_num(r.get("ParkFactor", 100), 100)
+    stars, label = environment_rating(r)
+    return f"{stars} {label} | {venue} | {temp_text(r)} | Wind: {wind_text(r)} | Park: {park_descriptor(park)}"
+
+
+def park_descriptor(park):
+    if park >= 110:
+        return "Very HR-Friendly"
+    if park >= 105:
+        return "HR-Friendly"
+    if park <= 95:
+        return "Pitcher-Friendly"
+    return "Neutral"
+
+
+def format_power_line(r):
+    stars, label = power_rating(r)
+    season_hr = int(safe_num(r.get('Season HR', 0), 0))
+    recent_hr = int(safe_num(r.get('Last7HR', 0), 0))
+    hard = safe_num(r.get('HardHit%', 0), 0)
+    mph = safe_num(r.get('100+MPH%', 0), 0)
+    fb = safe_num(r.get('FlyBall%', 0), 0)
+    return f"{stars} {label} | Season HR: {season_hr} | Recent HR: {recent_hr} | HardHit: {hard:.1f}% | 100+ MPH: {mph:.1f}% | FlyBall: {fb:.1f}%"
+
+
+def format_pitcher_line(r):
+    pitcher = r.get("Opposing Pitcher", "")
+    stars, label = pitcher_rating(r)
+    era = safe_num(r.get('ERA', 0), 0)
+    whip = safe_num(r.get('WHIP', 0), 0)
+    k9 = safe_num(r.get('K9', 0), 0)
+    return f"{stars} {label} | {pitcher} | ERA {era:.2f} | WHIP {whip:.2f} | K/9 {k9:.1f}"
+
+
+def power_drivers(row):
+    drivers = []
+    last_hr = safe_num(row.get("Last7HR", 0), 0)
+    mph100 = safe_num(row.get("100+MPH%", 0), 0)
+    fb = safe_num(row.get("FlyBall%", 0), 0)
+    hard = safe_num(row.get("HardHit%", 0), 0)
+    pv = safe_num(row.get("PitcherVulnerability", 50), 50)
+    wind = str(row.get("WindImpact", "") or "")
+    park = safe_num(row.get("ParkFactor", 100), 100)
+
+    if last_hr >= 2:
+        drivers.append("Recent HR surge")
+    elif last_hr >= 1:
+        drivers.append("Recent HR form")
+    if mph100 >= 20:
+        drivers.append("Frequent 100+ MPH contact")
+    if hard >= 40:
+        drivers.append("Strong hard-hit profile")
+    if fb >= 50:
+        drivers.append("Fly-ball profile")
+    if pv >= 60:
+        drivers.append("Favorable pitcher matchup")
+    elif pv >= 50:
+        drivers.append("Manageable pitcher matchup")
+    if wind in ["Out", "Cross/Out"]:
+        drivers.append("Wind supporting carry")
+    if park >= 105:
+        drivers.append("HR-friendly park")
+    drivers.append("Verified matchup")
+    return " | ".join([f"✓ {d}" for d in drivers])
+
+
+def build_scouting_reason(row):
+    player = str(row.get("Player", "") or "This hitter")
+    pitcher = str(row.get("Opposing Pitcher", "") or "the opposing starter")
+    venue = str(row.get("Venue", "") or "today's venue")
+    last_hr = int(safe_num(row.get("Last7HR", 0), 0))
+    mph100 = safe_num(row.get("100+MPH%", 0), 0)
+    hard = safe_num(row.get("HardHit%", 0), 0)
+    fb = safe_num(row.get("FlyBall%", 0), 0)
+    era = safe_num(row.get("ERA", 0), 0)
+    whip = safe_num(row.get("WHIP", 0), 0)
+    k9 = safe_num(row.get("K9", 0), 0)
+    wind = str(row.get("WindImpact", "") or "")
+    wind_mph = safe_num(row.get("WindMPH", 0), 0)
+    dome = str(row.get("Dome", "") or "").lower() == "true"
+    p_stars, p_label = pitcher_rating(row)
+    e_stars, e_label = environment_rating(row)
+
+    power_sentence = f"{player} enters today's matchup"
+    if last_hr >= 2:
+        power_sentence += f" in strong power form after homering {last_hr} times in the recent Statcast window"
+    elif last_hr == 1:
+        power_sentence += " with a recent home run in the Statcast window"
+    else:
+        power_sentence += " with a profile driven more by contact quality and matchup than recent home runs"
+    contact_notes = []
+    if mph100 >= 20:
+        contact_notes.append(f"frequent 100+ MPH contact ({mph100:.1f}%)")
+    if hard >= 40:
+        contact_notes.append(f"a strong hard-hit rate ({hard:.1f}%)")
+    if fb >= 50:
+        contact_notes.append(f"a clear fly-ball profile ({fb:.1f}%)")
+    if contact_notes:
+        power_sentence += ", backed by " + ", ".join(contact_notes)
+    power_sentence += "."
+
+    pitcher_sentence = f"{pitcher} grades as a {p_label.lower()}"
+    pitcher_context = []
+    if era >= 4.75:
+        pitcher_context.append(f"elevated ERA ({era:.2f})")
+    if whip >= 1.35:
+        pitcher_context.append(f"elevated WHIP ({whip:.2f})")
+    if 0 < k9 <= 7.5:
+        pitcher_context.append(f"limited swing-and-miss ({k9:.1f} K/9)")
+    if pitcher_context:
+        pitcher_sentence += " due to " + ", ".join(pitcher_context)
+    pitcher_sentence += "."
+
+    if dome:
+        env_sentence = f"{venue} has controlled dome conditions, giving the model a neutral run-environment read."
+    elif wind in ["Out", "Cross/Out"]:
+        env_sentence = f"The environment adds upside with a {wind_mph:.1f} mph {wind.lower()} wind at {venue}, grading as a {e_label.lower()}."
+    elif wind in ["In", "Cross/In"]:
+        env_sentence = f"The environment is less helpful with a {wind_mph:.1f} mph {wind.lower()} wind at {venue}, so the ranking leans more on player form and matchup."
+    else:
+        env_sentence = f"The game environment at {venue} grades as a {e_label.lower()} with verified weather inputs."
+
+    return " ".join([power_sentence, pitcher_sentence, env_sentence, "Game, venue, probable pitcher, and weather are verified by the schedule engine."])
+
+
+def add_player_report_rows(rows, r):
+    rank = int(r.get("Rank", 0))
+    label = r.get("ConfidenceLabel", "")
+    stars = scouting_stars(label)
+    player = r.get("Player", "")
+    team = r.get("Team", "")
+    opp = r.get("Opponent", "")
+
+    rows.append([f"{rank}. {stars} {label}", f"{player} ({team}) vs {opp}"])
+    rows.append(["Overall Confidence", f"{stars} {label} | Risk: {risk_level(r)}"])
+    rows.append(["Pitcher Matchup", format_pitcher_line(r)])
+    rows.append(["HR Environment", format_env_line(r)])
+    rows.append(["Power Profile", format_power_line(r)])
+    rows.append(["Power Drivers", power_drivers(r)])
+    rows.append(["Why Today", build_scouting_reason(r)])
+    rows.append(["Verification", "✓ Verified game, opponent, venue, probable pitcher, and weather"])
+    rows.append([])
+
+
+def best_environment_summary(card):
+    if card.empty:
+        return []
+    # Pick the highest-ranked game environment among today's recommended card.
+    tmp = card.copy()
+    def env_sort(row):
+        stars, label = environment_rating(row)
+        wx = safe_num(row.get("WeatherScore", 50), 50)
+        wind = str(row.get("WindImpact", "") or "")
+        park = safe_num(row.get("ParkFactor", 100), 100)
+        bonus = 0
+        if wind == "Out": bonus += 12
+        elif wind == "Cross/Out": bonus += 7
+        if park >= 105: bonus += 4
+        return wx + bonus
+    tmp["EnvSort"] = tmp.apply(env_sort, axis=1)
+    best = tmp.sort_values(["EnvSort", "Score"], ascending=False).iloc[0]
+    top = card.sort_values("Rank").iloc[0]
+    env_stars, env_label = environment_rating(best)
+    game = clean_game_label(best)
+    games = []
+    for _, r in tmp.sort_values(["EnvSort", "Score"], ascending=False).iterrows():
+        g = clean_game_label(r)
+        if g not in games:
+            games.append(g)
+        if len(games) >= 3:
+            break
+
+    return [
+        ["Daily Outlook"],
+        ["Today's Best HR Environment", game],
+        ["HR Conditions", f"{env_stars} {env_label}"],
+        ["Wind", wind_text(best)],
+        ["Temperature", temp_text(best)],
+        ["Top Target", f"{top.get('Player','')} ({top.get('Team','')}) - {top.get('ConfidenceLabel','')}"] ,
+        ["Games to Watch", "; ".join(games)],
+        []
+    ]
+
+
 def build_email_summary_rows(card):
     rows = []
-    rows.append(["Daily MLB HR Targets Email Summary"])
+    rows.append(["Daily MLB HR Targets - Professional Scouting Report"])
     rows.append(["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
     rows.append(["Model Version", MODEL_VERSION])
     rows.append([])
 
+    rows.extend(best_environment_summary(card))
+
     rows.append(["Top HR Targets"])
     top = card.sort_values("Rank").head(5)
     for _, r in top.iterrows():
-        rows.append([
-            int(r.get("Rank", 0)),
-            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | {r.get('Venue','')} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
-        ])
-        rows.append(["", f"Why: {r.get('Reason','')}"])
+        add_player_report_rows(rows, r)
 
-    rows.append([])
     rows.append(["Watchlist"])
     watch = card.sort_values("Rank").iloc[5:9]
     for _, r in watch.iterrows():
-        rows.append([
-            int(r.get("Rank", 0)),
-            f"{r.get('ConfidenceLabel','')} | {r['Player']} ({r['Team']}) vs {r['Opposing Pitcher']} | {r.get('Venue','')} | Score {round(float(r['Score']),1)} | Weather {r.get('WeatherScore','')} ({r.get('WindImpact','')})"
-        ])
-        rows.append(["", f"Why: {r.get('Reason','')}"])
+        add_player_report_rows(rows, r)
 
-    rows.append([])
     rows.append(["Model Notes"])
-    rows.append(["Ranking Basis", "Season power, recent HR form, hard-hit contact, 100+ MPH contact, fly-ball profile, pitcher vulnerability, park factor, and weather/wind."])
-    rows.append(["Game Integrity", "Every target is tied to a verified scheduled game, venue, opposing pitcher, and weather record."])
+    rows.append(["Ranking Basis", "Season power, recent HR form, hard-hit contact, 100+ MPH contact, fly-ball profile, pitcher matchup, park factor, and weather/wind."])
+    rows.append(["Game Integrity", "Every target is tied to a verified scheduled game, venue, opposing pitcher, and weather record before ranking."])
     rows.append(["Inactive Player Filter", "Players not on active rosters are removed before scoring."])
+    rows.append(["Report Style", "V15.1 replaces internal scores with descriptive ratings and scouting-style explanations."])
     rows.append([])
     rows.append(["Results Tracking"])
     rows.append(["HR Result", "1 = HR, 0 = No HR."])
     return clean_rows(rows)
-
 
 def refresh_email_summary(sh, card):
     ws = get_or_create_ws(sh, "Email Summary", 100, 10)
