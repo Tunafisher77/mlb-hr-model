@@ -3,15 +3,18 @@ import re, json, math, requests
 import pandas as pd
 import numpy as np
 from datetime import date, timedelta, datetime
+from zoneinfo import ZoneInfo
 from pybaseball import statcast_batter
 import gspread
 from google.oauth2.service_account import Credentials
 
-TODAY = date.today()
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+TODAY = datetime.now(PACIFIC_TZ).date()
 YEAR = TODAY.year
 START = TODAY - timedelta(days=14)
+RUN_TIMESTAMP_LOCAL = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-MODEL_VERSION = "Automated V16 Production - Stable HR Prediction Engine"
+MODEL_VERSION = "Automated V16.1 - Schedule Integrity Fix"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
@@ -219,28 +222,52 @@ def pitcher_source_label(pid, pname):
     return "Missing from MLB probablePitcher feed"
 
 
-def fetch_active_roster_player_ids(team_ids):
+def fetch_active_roster_players(team_ids):
     """
-    Pulls active roster for today's scheduled teams.
-    This removes IL/out/inactive players before scoring.
-    If MLB roster API fails, returns an empty set and the model continues instead of crashing.
+    Pulls active rosters for today's verified schedule teams and returns a player-id map.
+
+    This is the V16.1 schedule-integrity fix:
+    - Player team assignment comes from the current active roster, not the season stat endpoint.
+    - This prevents traded/old-team stat records from attaching to the wrong game.
+    - A hitter is only eligible if his active roster team has a verified game today.
     """
-    active_ids = set()
+    active_players = {}
     for tid in sorted(set([x for x in team_ids if x])):
         try:
             data = requests.get(
                 f"https://statsapi.mlb.com/api/v1/teams/{int(tid)}/roster",
-                params={"rosterType":"active"},
+                params={"rosterType": "active"},
                 timeout=20
             ).json()
+            team_data = requests.get(
+                f"https://statsapi.mlb.com/api/v1/teams/{int(tid)}",
+                timeout=20
+            ).json()
+            team_obj = (team_data.get("teams") or [{}])[0]
+            team_abbr = team_abbrev(team_obj)
+            team_name = team_obj.get("name", "")
+
             for item in data.get("roster", []):
                 person = item.get("person", {})
                 pid = person.get("id")
                 if pid:
-                    active_ids.add(int(pid))
+                    active_players[int(pid)] = {
+                        "Player ID": int(pid),
+                        "Player": person.get("fullName", ""),
+                        "Team ID": int(tid),
+                        "Team": team_abbr,
+                        "Team Name": team_name,
+                        "RosterStatus": "Active",
+                    }
         except Exception as e:
             print(f"Active roster lookup failed for team {tid}: {e}")
-    return active_ids
+    return active_players
+
+
+def fetch_active_roster_player_ids(team_ids):
+    """Backward-compatible wrapper used by older sections."""
+    return set(fetch_active_roster_players(team_ids).keys())
+
 
 def target_label_from_score(score):
     """
@@ -380,41 +407,56 @@ def build_reason_text(row):
 
 def build_model():
     """
-    V14 Game Integrity Engine.
-    The game schedule is the source of truth. We build today's official games first,
-    then attach hitters to their team ID so opponent, venue, opposing pitcher, and weather
-    all come from the same verified game record.
+    V16.1 Schedule Integrity Engine.
+
+    The game schedule is the source of truth. The hitter's current team is taken from
+    today's active roster, not from the season HR stats endpoint. This prevents old-team
+    or traded-player records from being attached to the wrong opponent, pitcher, venue,
+    or weather record.
     """
+    sched_date = TODAY.isoformat()
+    print(f"Schedule date used for MLB feed: {sched_date} Pacific")
+
     sched = requests.get(
         "https://statsapi.mlb.com/api/v1/schedule",
-        params={"sportId": 1, "date": TODAY.isoformat(), "hydrate": "probablePitcher,team"},
+        params={"sportId": 1, "date": sched_date, "hydrate": "probablePitcher,team"},
         timeout=30
     ).json()
 
     matchups = []
     todays_team_ids = []
+
     for day in sched.get("dates", []):
         for g in day.get("games", []):
             game_pk = g.get("gamePk", "")
             game_date = g.get("gameDate", "")
             status = g.get("status", {}).get("detailedState", "")
             venue = g.get("venue", {}).get("name", "")
-            away_team = g.get("teams", {}).get("away", {}).get("team", {})
-            home_team = g.get("teams", {}).get("home", {}).get("team", {})
+
+            away_team = g.get("teams", {}).get("away", {}).get("team", {}) or {}
+            home_team = g.get("teams", {}).get("home", {}).get("team", {}) or {}
+
             away_id = away_team.get("id")
             home_id = home_team.get("id")
+
             away = team_abbrev(away_team)
             home = team_abbrev(home_team)
+
             away_name = away_team.get("name", "")
             home_name = home_team.get("name", "")
+
             away_p = g.get("teams", {}).get("away", {}).get("probablePitcher", {}) or {}
             home_p = g.get("teams", {}).get("home", {}).get("probablePitcher", {}) or {}
+
             away_p_name = away_p.get("fullName", "Unknown")
             away_p_id = away_p.get("id")
             home_p_name = home_p.get("fullName", "Unknown")
             home_p_id = home_p.get("id")
+
             weather = get_weather_for_venue(venue)
+
             base = {
+                "ScheduleDatePacific": sched_date,
                 "GamePk": game_pk,
                 "GameDateUTC": game_date,
                 "GameStatus": status,
@@ -426,17 +468,19 @@ def build_model():
                 "AwayTeamName": away_name,
                 **weather
             }
+
             if away_id:
                 todays_team_ids.append(away_id)
-                verified = bool(home_id and venue and home_p_id)
+                verified = bool(game_pk and away_id and home_id and venue and home_p_id)
                 notes = []
+                if not game_pk: notes.append("missing gamePk")
                 if not home_id: notes.append("missing opponent team id")
                 if not venue: notes.append("missing venue")
                 if not home_p_id: notes.append("missing opposing probable pitcher")
                 matchups.append({
-                    "Team ID": away_id,
+                    "Team ID": int(away_id),
                     "Team": away,
-                    "Opponent Team ID": home_id,
+                    "Opponent Team ID": int(home_id) if home_id else "",
                     "Opponent": home,
                     "HomeAway": "Away",
                     "Opposing Pitcher": home_p_name,
@@ -444,20 +488,23 @@ def build_model():
                     "PitcherSource": pitcher_source_label(home_p_id, home_p_name),
                     "PitcherConfidence": "High" if home_p_id else "Low",
                     "MatchupVerified": verified,
-                    "VerificationNotes": "Verified" if verified else "; ".join(notes),
+                    "VerificationNotes": "Verified: GamePk+TeamID+OpponentID+Venue+ProbablePitcher" if verified else "; ".join(notes),
+                    "ScheduleIntegrityKey": f"{game_pk}:{away_id}:{home_id}:{home_p_id}:{venue}",
                     **base
                 })
+
             if home_id:
                 todays_team_ids.append(home_id)
-                verified = bool(away_id and venue and away_p_id)
+                verified = bool(game_pk and home_id and away_id and venue and away_p_id)
                 notes = []
+                if not game_pk: notes.append("missing gamePk")
                 if not away_id: notes.append("missing opponent team id")
                 if not venue: notes.append("missing venue")
                 if not away_p_id: notes.append("missing opposing probable pitcher")
                 matchups.append({
-                    "Team ID": home_id,
+                    "Team ID": int(home_id),
                     "Team": home,
-                    "Opponent Team ID": away_id,
+                    "Opponent Team ID": int(away_id) if away_id else "",
                     "Opponent": away,
                     "HomeAway": "Home",
                     "Opposing Pitcher": away_p_name,
@@ -465,7 +512,8 @@ def build_model():
                     "PitcherSource": pitcher_source_label(away_p_id, away_p_name),
                     "PitcherConfidence": "High" if away_p_id else "Low",
                     "MatchupVerified": verified,
-                    "VerificationNotes": "Verified" if verified else "; ".join(notes),
+                    "VerificationNotes": "Verified: GamePk+TeamID+OpponentID+Venue+ProbablePitcher" if verified else "; ".join(notes),
+                    "ScheduleIntegrityKey": f"{game_pk}:{home_id}:{away_id}:{away_p_id}:{venue}",
                     **base
                 })
 
@@ -473,48 +521,60 @@ def build_model():
     if matchups.empty:
         raise RuntimeError("No MLB games found for today. Schedule feed returned empty.")
 
-    # Only verified team-game records are allowed into the scoring pool.
     verified_matchups = matchups[matchups["MatchupVerified"] == True].copy()
     verified_team_ids = set(pd.to_numeric(verified_matchups["Team ID"], errors="coerce").dropna().astype(int).tolist())
     print(f"Game integrity: {len(verified_matchups)} verified team-game records out of {len(matchups)}")
+    print(f"Verified teams today: {sorted(verified_team_ids)}")
 
-    # Pull season HR leaders, but keep only hitters whose current team ID is in a verified game today.
+    # V16.1: build current-team player map from active rosters before reading season stats.
+    active_players = fetch_active_roster_players(list(verified_team_ids))
+    if not active_players:
+        raise RuntimeError("Active roster lookup failed for all verified teams. Refusing to score stale player-team data.")
+    print(f"Active roster map built: {len(active_players)} active players on verified teams")
+
+    # Pull season HR leaders, then assign current team from active roster only.
     d = requests.get(
         "https://statsapi.mlb.com/api/v1/stats",
-        params={"stats":"season","group":"hitting","playerPool":"ALL","sortStat":"homeRuns","limit":80,"season":YEAR,"hydrate":"team"},
+        params={"stats": "season", "group": "hitting", "playerPool": "ALL", "sortStat": "homeRuns", "limit": 200, "season": YEAR, "hydrate": "team"},
         timeout=30
     ).json()
+
     rows = []
+    skipped_old_team = 0
     for s in d.get("stats", [{}])[0].get("splits", []):
-        team = s.get("team", {}) or {}
-        tid = team.get("id")
+        player_obj = s.get("player", {}) or {}
+        pid = player_obj.get("id")
         try:
-            tid_int = int(tid) if tid not in [None, ""] else None
+            pid_int = int(pid) if pid not in [None, ""] else None
         except Exception:
-            tid_int = None
-        if tid_int not in verified_team_ids:
+            pid_int = None
+
+        if not pid_int or pid_int not in active_players:
+            skipped_old_team += 1
             continue
+
+        roster = active_players[pid_int]
+        roster_team_id = int(roster["Team ID"])
+        if roster_team_id not in verified_team_ids:
+            skipped_old_team += 1
+            continue
+
         rows.append({
-            "Player": s.get("player", {}).get("fullName"),
-            "Player ID": s.get("player", {}).get("id"),
-            "Team": team_abbrev(team),
-            "Team ID": tid_int,
-            "Team Name": team.get("name", ""),
+            "Player": roster.get("Player") or player_obj.get("fullName"),
+            "Player ID": pid_int,
+            "Team": roster.get("Team", ""),
+            "Team ID": roster_team_id,
+            "Team Name": roster.get("Team Name", ""),
+            "RosterStatus": roster.get("RosterStatus", "Active"),
             "Season HR": int(s.get("stat", {}).get("homeRuns", 0) or 0)
         })
+
     model = pd.DataFrame(rows)
     if model.empty:
-        raise RuntimeError("No verified hitters found after schedule/team filter.")
+        raise RuntimeError("No eligible active hitters found after V16.1 roster/team/schedule integrity filter.")
 
-    # Active roster filter for the verified teams only.
-    active_ids = fetch_active_roster_player_ids(list(verified_team_ids))
-    if active_ids:
-        before_count = len(model)
-        model["Player ID"] = pd.to_numeric(model["Player ID"], errors="coerce").fillna(0).astype(int)
-        model = model[model["Player ID"].isin(active_ids)].copy()
-        print(f"Active roster filter: {before_count} candidates -> {len(model)} active candidates")
-    else:
-        print("Active roster filter skipped: roster feed unavailable")
+    print(f"Eligible hitters from active rosters: {len(model)}")
+    print(f"Skipped hitters not on verified active rosters: {skipped_old_team}")
 
     out = []
     for _, r in model.iterrows():
@@ -528,60 +588,79 @@ def build_model():
             out.append([r["Player"], hh, c100, fb, recent])
         except Exception:
             out.append([r["Player"], 0, 0, 0, 0])
-    model = model.merge(pd.DataFrame(out, columns=["Player","HardHit%","100+MPH%","FlyBall%","Last7HR"]), on="Player", how="left")
+    model = model.merge(pd.DataFrame(out, columns=["Player", "HardHit%", "100+MPH%", "FlyBall%", "Last7HR"]), on="Player", how="left")
 
     pitch_rows = []
-    for pid, pname in verified_matchups[["Opposing Pitcher ID","Opposing Pitcher"]].drop_duplicates().dropna().values:
+    for pid, pname in verified_matchups[["Opposing Pitcher ID", "Opposing Pitcher"]].drop_duplicates().dropna().values:
         try:
             data = requests.get(
                 f"https://statsapi.mlb.com/api/v1/people/{int(pid)}/stats",
-                params={"stats":"season","group":"pitching","season":YEAR},
+                params={"stats": "season", "group": "pitching", "season": YEAR},
                 timeout=20
             ).json()
             splits = data.get("stats", [{}])[0].get("splits", [])
             st = splits[0]["stat"] if splits else {}
-            pitch_rows.append({"Opposing Pitcher ID":pid,"ERA":safe_float(st.get("era")),"WHIP":safe_float(st.get("whip")),"K9":safe_float(st.get("strikeoutsPer9Inn"))})
+            pitch_rows.append({"Opposing Pitcher ID": pid, "ERA": safe_float(st.get("era")), "WHIP": safe_float(st.get("whip")), "K9": safe_float(st.get("strikeoutsPer9Inn"))})
         except Exception:
-            pitch_rows.append({"Opposing Pitcher ID":pid,"ERA":0,"WHIP":0,"K9":0})
+            pitch_rows.append({"Opposing Pitcher ID": pid, "ERA": 0, "WHIP": 0, "K9": 0})
+
     pdf = pd.DataFrame(pitch_rows)
     if len(pdf):
         pdf["PitcherVulnerability"] = norm(pdf["ERA"]) * 0.40 + norm(pdf["WHIP"]) * 0.30 + (100 - norm(pdf["K9"])) * 0.30
     else:
-        pdf = pd.DataFrame(columns=["Opposing Pitcher ID","ERA","WHIP","K9","PitcherVulnerability"])
+        pdf = pd.DataFrame(columns=["Opposing Pitcher ID", "ERA", "WHIP", "K9", "PitcherVulnerability"])
 
-    # Team ID merge prevents abbreviation/name mismatch bugs.
+    # V16.1: inner join by active roster Team ID only. This is the hard binding to today's verified game.
     model = model.merge(verified_matchups, on=["Team ID"], how="inner", suffixes=("", "_game"))
+
     if "Team_game" in model.columns:
         model["Team"] = model["Team_game"].where(model["Team_game"].astype(str).str.len() > 0, model["Team"])
         model = model.drop(columns=["Team_game"])
 
     model = model.merge(pdf, on="Opposing Pitcher ID", how="left")
-    model["PitcherKnown"] = model["Opposing Pitcher ID"].apply(lambda x: bool(str(x).strip()) and str(x).strip().lower() not in ["nan", "none", ""])
-    model = model[model["MatchupVerified"] == True].copy()
-    model = model[model["PitcherKnown"] == True].copy()
 
-    for c in ["ERA","WHIP","K9","PitcherVulnerability"]:
-        model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf,-np.inf],0).fillna(0)
-    for c in ["ParkFactor","WeatherScore","TempF","Humidity","WindMPH","WindBoost"]:
-        model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf,-np.inf],50).fillna(50)
+    model["PitcherKnown"] = model["Opposing Pitcher ID"].apply(lambda x: bool(str(x).strip()) and str(x).strip().lower() not in ["nan", "none", ""])
+    model["RosterTeamVerified"] = model.apply(lambda r: int(r["Team ID"]) in verified_team_ids and str(r.get("RosterStatus", "")) == "Active", axis=1)
+    model["HardVerified"] = (
+        (model["MatchupVerified"] == True) &
+        (model["PitcherKnown"] == True) &
+        (model["RosterTeamVerified"] == True) &
+        (model["GamePk"].astype(str).str.len() > 0) &
+        (model["Venue"].astype(str).str.len() > 0)
+    )
+
+    bad = model[model["HardVerified"] != True]
+    if len(bad):
+        print(f"Removed {len(bad)} rows failing hard verification.")
+    model = model[model["HardVerified"] == True].copy()
+
+    if model.empty:
+        raise RuntimeError("All hitters failed V16.1 hard schedule integrity verification. Refusing to send bad report.")
+
+    for c in ["ERA", "WHIP", "K9", "PitcherVulnerability"]:
+        model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
+    for c in ["ParkFactor", "WeatherScore", "TempF", "Humidity", "WindMPH", "WindBoost"]:
+        model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf, -np.inf], 50).fillna(50)
 
     model["Score"] = (
         norm(model["Season HR"]) * 0.07 +
         norm(model["Last7HR"]) * 0.12 +
-        norm(model["HardHit%"] ) * 0.16 +
-        norm(model["100+MPH%"] ) * 0.12 +
-        norm(model["FlyBall%"] ) * 0.08 +
-        norm(model["PitcherVulnerability"] ) * 0.19 +
-        norm(model["ParkFactor"] ) * 0.07 +
-        norm(model["WeatherScore"] ) * 0.19
+        norm(model["HardHit%"]) * 0.16 +
+        norm(model["100+MPH%"]) * 0.12 +
+        norm(model["FlyBall%"]) * 0.08 +
+        norm(model["PitcherVulnerability"]) * 0.19 +
+        norm(model["ParkFactor"]) * 0.07 +
+        norm(model["WeatherScore"]) * 0.19
     )
 
-    model = model.replace([np.inf,-np.inf], 0).fillna("")
+    model = model.replace([np.inf, -np.inf], 0).fillna("")
     model = model.sort_values("Score", ascending=False).reset_index(drop=True)
     model["Rank"] = model.index + 1
     model["Group"] = model["Rank"].apply(lambda x: "Group 1" if x <= 10 else ("Group 2" if x <= 20 else "Group 3"))
     model["Tier"] = model["Rank"].apply(tier_from_rank)
+
     return model, matchups
+
 
 def normalize_name_for_odds(name):
     return "".join(ch.lower() for ch in str(name) if ch.isalnum())
@@ -1319,7 +1398,7 @@ def best_environment_summary(card):
 def build_email_summary_rows(card):
     rows = []
     rows.append(["Daily MLB HR Targets - Professional Scouting Report"])
-    rows.append(["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    rows.append(["Last Updated", RUN_TIMESTAMP_LOCAL])
     rows.append(["Model Version", MODEL_VERSION])
     rows.append([])
 
@@ -1339,7 +1418,7 @@ def build_email_summary_rows(card):
     rows.append(["Ranking Basis", "Season power, recent HR form, hard-hit contact, 100+ MPH contact, fly-ball profile, pitcher matchup, park factor, and weather/wind."])
     rows.append(["Game Integrity", "Every target is tied to a verified scheduled game, venue, opposing pitcher, and weather record before ranking."])
     rows.append(["Inactive Player Filter", "Players not on active rosters are removed before scoring."])
-    rows.append(["Report Style", "V15.2 keeps the scoring engine locked while polishing the report with executive summaries, scouting cards, cleaner ratings, power drivers, and reliability logging."])
+    rows.append(["Report Style", "V16.1 keeps the scoring engine locked and adds hard schedule/roster integrity verification."])
     rows.append([])
     rows.append(["Results Tracking"])
     rows.append(["HR Result", "1 = HR, 0 = No HR."])
@@ -1377,7 +1456,7 @@ def refresh_hr_targets(sh, card):
         "Venue","Verified","Score","Season HR","Last7HR","HardHit%","100+MPH%","FlyBall%",
         "PitcherVulnerability","ParkFactor","WeatherScore","WindImpact","Reason"
     ]
-    rows = [["Daily HR Targets"], ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")], [], headers]
+    rows = [["Daily HR Targets"], ["Last Updated", RUN_TIMESTAMP_LOCAL], [], headers]
     for _, r in card.sort_values("Rank").iterrows():
         rows.append([
             TODAY.isoformat(), int(r.get("Rank",0)), r.get("Tier",""), r.get("ConfidenceLabel",""),
@@ -1432,7 +1511,7 @@ def refresh_run_log(sh, model, matchups, card):
     except Exception:
         pass
     rows = [
-        ["Run Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        ["Run Timestamp", RUN_TIMESTAMP_LOCAL],
         ["Model Version", MODEL_VERSION],
         ["Games / Team Records Verified", verified_games],
         ["Probable Pitchers Matched", verified_pitchers],
@@ -1497,7 +1576,7 @@ def write_to_sheet(model, matchups):
     summary_ws.clear()
     summary_rows = [
         ["Daily MLB HR Picks Scorecard",""],
-        ["Last Automated Run",datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        ["Last Automated Run",RUN_TIMESTAMP_LOCAL],
         ["Model Version",MODEL_VERSION],
         ["Primary Picks",len(card[card["Tier"]=="Primary"])],
         ["Secondary Picks",len(card[card["Tier"]=="Secondary"])],
