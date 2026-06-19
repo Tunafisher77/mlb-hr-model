@@ -1582,13 +1582,13 @@ def write_to_sheet(model, matchups):
         ["Secondary Picks",len(card[card["Tier"]=="Secondary"])],
         ["Longshot Picks",len(card[card["Tier"]=="Longshot"])],
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
-        ["Pitcher Status","V15.2 requires verified opposing probable pitcher before scoring"],
+        ["Pitcher Status","V16.1 requires verified opposing probable pitcher before scoring"],
         ["Results Tracking","Manual HR Result remains: 1 = HR, 0 = No HR"],
-        ["Target Ranking","V15.2 polished, verified HR targets with confidence labels"],
+        ["Target Ranking","V16.1 polished, verified HR targets with confidence labels"],
         ["HR Targets","HR Targets tab added"],
         ["Inactive Filter","Active roster filter plus verified game/team merge before scoring"],
         ["Game Integrity Log","Added to verify player, team, venue, pitcher, and weather binding"],
-        ["Email Summary","Email Summary tab upgraded for polished V15.2 report"],
+        ["Email Summary","Email Summary tab upgraded for polished V16.1 report"],
         ["Sheet Updated","Yes"],
     ]
     summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
