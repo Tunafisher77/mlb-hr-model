@@ -4,13 +4,58 @@ import math
 import requests
 import pandas as pd
 import numpy as np
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 import gspread
 from google.oauth2.service_account import Credentials
 
-TODAY = date.today()
+MODEL_VERSION = "Game Picks V2.1.1 - Schedule Integrity Fix + Eastern Slate Date"
+MLB_SCHEDULE_TZ = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
+MLB_SCHEDULE_DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
+
+
+def now_in_mlb_timezone():
+    """Return current datetime in MLB slate timezone.
+
+    GitHub Actions and Apps Script can run in UTC or Pacific time. MLB schedule dates
+    should be selected using Eastern time so a late-night Pacific run does not pull
+    yesterday's schedule for the next morning's report.
+    """
+    if ZoneInfo:
+        return datetime.now(ZoneInfo(MLB_SCHEDULE_TZ))
+    return datetime.utcnow()
+
+
+def resolve_schedule_date():
+    """Resolve the official schedule date used for this report.
+
+    Priority:
+      1. MLB_SCHEDULE_DATE env override in YYYY-MM-DD format for manual backfills/tests.
+      2. Eastern-time date. If the workflow is run in the evening Eastern time, assume it
+         is preparing tomorrow morning's report and use the next calendar date.
+
+    This prevents the common failure where a 10 PM Pacific GitHub run still has a
+    Pacific date of yesterday while MLB's slate date has already advanced in Eastern time.
+    """
+    if MLB_SCHEDULE_DATE_OVERRIDE:
+        try:
+            return datetime.strptime(MLB_SCHEDULE_DATE_OVERRIDE, "%Y-%m-%d").date(), "Environment override MLB_SCHEDULE_DATE"
+        except Exception:
+            raise RuntimeError("Invalid MLB_SCHEDULE_DATE. Use YYYY-MM-DD.")
+
+    now_mlb = now_in_mlb_timezone()
+    # Most production runs happen before the morning email. If run after 6 PM ET,
+    # prepare the next day's slate rather than re-scoring games already underway/final.
+    if now_mlb.hour >= 18:
+        return (now_mlb.date() + timedelta(days=1)), f"{MLB_SCHEDULE_TZ} evening run; using next day's MLB slate"
+    return now_mlb.date(), f"{MLB_SCHEDULE_TZ} current MLB slate date"
+
+
+TODAY, SCHEDULE_DATE_REASON = resolve_schedule_date()
 YEAR = TODAY.year
-MODEL_VERSION = "Game Picks V2.1 - Schedule Integrity Fix"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
@@ -340,12 +385,8 @@ def is_playable_game_status(status):
     if any(term in st for term in blocked_terms):
         return False
     allowed = {
-        "scheduled", "pre-game", "warmup", "in progress", "final",
-        "game over", "manager challenge", "review", "delayed start"
+        "scheduled", "pre-game", "warmup"
     }
-    # Do not allow delayed start despite MLB sometimes treating it as official.
-    if st == "delayed start":
-        return False
     return st in allowed
 
 
@@ -431,6 +472,7 @@ def build_schedule_games():
 
             record = {
                 "ScheduleDateUsed": schedule_date,
+                "ScheduleDateReason": SCHEDULE_DATE_REASON,
                 "GamePk": game_pk,
                 "GameDateUTC": g.get("gameDate", ""),
                 "GameStatus": status,
@@ -454,6 +496,7 @@ def build_schedule_games():
             verified = fail_reason == ""
             integrity = {
                 "Date Used": schedule_date,
+                "Date Logic": SCHEDULE_DATE_REASON,
                 "gamePk": game_pk,
                 "Away Team": record["AwayTeam"],
                 "Away Team Name": record["AwayTeamName"],
@@ -627,7 +670,7 @@ def build_email_rows(picks):
     if picks.empty:
         return clean_rows([
             ["Daily MLB Game Picks - Stats Only"],
-            ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+            ["Last Updated", now_in_mlb_timezone().strftime("%Y-%m-%d %H:%M:%S %Z")],
             ["Model Version", MODEL_VERSION],
             [],
             ["Daily Outlook"],
@@ -642,12 +685,14 @@ def build_email_rows(picks):
     highest_total = high_score.sort_values("Total Runs", ascending=False).iloc[0]
     rows = [
         ["Daily MLB Game Picks - Stats Only"],
-        ["Last Updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+        ["Last Updated", now_in_mlb_timezone().strftime("%Y-%m-%d %H:%M:%S %Z")],
         ["Model Version", MODEL_VERSION],
         [],
         ["Daily Outlook"],
         ["Verified Games Evaluated", len(picks)],
         ["Schedule Source", "MLB Stats API official schedule only"],
+        ["Schedule Date Used", TODAY.isoformat()],
+        ["Schedule Date Logic", SCHEDULE_DATE_REASON],
         ["Best Overall Pick", f"{top['Projected Winner']} over {top['Opponent']} - {top['Confidence']} ({top['Win Probability']}%)"],
         ["Best Run Margin Lean", f"{top['Projected Winner']} - {top['Run Margin Lean']} | Expected Margin {top['Expected Margin']}"],
         ["Highest Projected Scoring Game", f"{highest_total['Game']} - {highest_total['Total Runs']:.1f} projected runs"],
@@ -742,3 +787,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
