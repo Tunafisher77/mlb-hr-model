@@ -9,15 +9,35 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
-TODAY = datetime.now(PACIFIC_TZ).date()
-YEAR = TODAY.year
-START = TODAY - timedelta(days=14)
-RUN_TIMESTAMP_LOCAL = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+EASTERN_TZ = ZoneInfo("America/New_York")
+RUN_NOW_LOCAL = datetime.now(PACIFIC_TZ)
+RUN_NOW_EASTERN = datetime.now(EASTERN_TZ)
 
-MODEL_VERSION = "Automated V16.1 - Schedule Integrity Fix"
+# MLB schedule/slate date must be based on Eastern time, not the GitHub runner or Pacific time.
+# This prevents late-night Pacific runs from accidentally pulling yesterday's official schedule.
+SCHEDULE_DATE = RUN_NOW_EASTERN.date()
+TODAY = SCHEDULE_DATE  # backward-compatible alias used throughout the existing V16 code
+YEAR = SCHEDULE_DATE.year
+START = SCHEDULE_DATE - timedelta(days=14)
+RUN_TIMESTAMP_LOCAL = RUN_NOW_LOCAL.strftime("%Y-%m-%d %H:%M:%S %Z")
+RUN_TIMESTAMP_EASTERN = RUN_NOW_EASTERN.strftime("%Y-%m-%d %H:%M:%S %Z")
+SCHEDULE_DATE_LOGIC = "Official MLB slate date from America/New_York"
+
+MODEL_VERSION = "Automated V16.2 - Eastern Slate Schedule Fix"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+
+UNPLAYABLE_STATUS_KEYWORDS = [
+    "postponed", "cancelled", "canceled", "suspended", "final", "game over"
+]
+
+def is_playable_game_status(status):
+    """Return True for games that can be considered part of today's playable slate."""
+    s = str(status or "").strip().lower()
+    if not s:
+        return False
+    return not any(k in s for k in UNPLAYABLE_STATUS_KEYWORDS)
 
 def auth_google():
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
@@ -94,7 +114,9 @@ PARK_FACTORS = {
     "Oriole Park at Camden Yards":102,"Angel Stadium":101,"Nationals Park":101,"Chase Field":100,
     "Truist Park":100,"Busch Stadium":99,"Comerica Park":99,"Progressive Field":99,"Rogers Centre":99,
     "Target Field":98,"American Family Field":98,"PNC Park":98,"Wrigley Field":100,"T-Mobile Park":96,
-    "Tropicana Field":95,"loanDepot park":95,"Petco Park":94,"Oracle Park":94
+    "Tropicana Field":95,"loanDepot park":95,"Petco Park":94,"Oracle Park":94,
+    "Citi Field":97,"Sutter Health Park":100,"Rate Field":98,"Guaranteed Rate Field":98,
+    "George M. Steinbrenner Field":98,"TD Ballpark":100,"London Stadium":105,"Rickwood Field":100
 }
 
 def park_factor(venue):
@@ -129,6 +151,14 @@ STADIUMS = {
     "loanDepot park": {"lat":25.7781,"lon":-80.2197,"dome":True,"cf":65},
     "Globe Life Field": {"lat":32.7473,"lon":-97.0842,"dome":True,"cf":75},
     "Oriole Park at Camden Yards": {"lat":39.2840,"lon":-76.6217,"dome":False,"cf":45},
+    "Citi Field": {"lat":40.7571,"lon":-73.8458,"dome":False,"cf":5},
+    "Sutter Health Park": {"lat":38.5804,"lon":-121.5139,"dome":False,"cf":40},
+    "Rate Field": {"lat":41.8300,"lon":-87.6339,"dome":False,"cf":60},
+    "Guaranteed Rate Field": {"lat":41.8300,"lon":-87.6339,"dome":False,"cf":60},
+    "George M. Steinbrenner Field": {"lat":27.9799,"lon":-82.5068,"dome":False,"cf":60},
+    "TD Ballpark": {"lat":28.0037,"lon":-82.7862,"dome":False,"cf":55},
+    "London Stadium": {"lat":51.5386,"lon":-0.0165,"dome":False,"cf":25},
+    "Rickwood Field": {"lat":33.5050,"lon":-86.8550,"dome":False,"cf":35},
 }
 
 def angle_diff(a, b):
@@ -175,9 +205,20 @@ def weather_score_from_values(temp_f, humidity, wind_boost, dome):
 def get_weather_for_venue(venue):
     st = STADIUMS.get(venue)
     if not st:
-        return {"TempF":None,"Humidity":None,"WindMPH":None,"WindFromDir":None,"WindBlowingTo":None,"WindAngleToCF":None,"WindImpact":"Unknown","WindBoost":0,"Dome":False,"WeatherScore":50}
+        return {
+            "TempF":None,"Humidity":None,"WindMPH":None,"WindFromDir":None,
+            "WindBlowingTo":None,"WindAngleToCF":None,"WindImpact":"Unknown","WindBoost":0,
+            "Dome":False,"WeatherScore":50,"WeatherSource":"No venue coordinate match",
+            "WeatherStatus":"No stadium coordinates for official venue; weather not verified",
+            "WeatherTiedToVenue":False
+        }
     if st["dome"]:
-        return {"TempF":72,"Humidity":50,"WindMPH":0,"WindFromDir":"","WindBlowingTo":"","WindAngleToCF":"","WindImpact":"Dome","WindBoost":0,"Dome":True,"WeatherScore":50}
+        return {
+            "TempF":72,"Humidity":50,"WindMPH":0,"WindFromDir":"","WindBlowingTo":"",
+            "WindAngleToCF":"","WindImpact":"Dome","WindBoost":0,"Dome":True,"WeatherScore":50,
+            "WeatherSource":"Venue dome model","WeatherStatus":"Verified dome/controlled conditions tied to official venue",
+            "WeatherTiedToVenue":True
+        }
     try:
         w = requests.get(
             "https://api.open-meteo.com/v1/forecast",
@@ -195,9 +236,20 @@ def get_weather_for_venue(venue):
         wd_from = safe_float(cur.get("wind_direction_10m"), default=0)
         impact, boost, blowing_to, diff = wind_impact(wd_from, wind, st["cf"], False)
         wx_score = weather_score_from_values(temp, hum, boost, False)
-        return {"TempF":temp,"Humidity":hum,"WindMPH":wind,"WindFromDir":wd_from,"WindBlowingTo":blowing_to,"WindAngleToCF":diff,"WindImpact":impact,"WindBoost":round(boost,1),"Dome":False,"WeatherScore":wx_score}
-    except Exception:
-        return {"TempF":None,"Humidity":None,"WindMPH":None,"WindFromDir":None,"WindBlowingTo":None,"WindAngleToCF":None,"WindImpact":"Weather API Error","WindBoost":0,"Dome":False,"WeatherScore":50}
+        return {
+            "TempF":temp,"Humidity":hum,"WindMPH":wind,"WindFromDir":wd_from,
+            "WindBlowingTo":blowing_to,"WindAngleToCF":diff,"WindImpact":impact,"WindBoost":round(boost,1),
+            "Dome":False,"WeatherScore":wx_score,"WeatherSource":"Open-Meteo venue coordinates",
+            "WeatherStatus":"Verified weather tied to official venue coordinates","WeatherTiedToVenue":True
+        }
+    except Exception as e:
+        return {
+            "TempF":None,"Humidity":None,"WindMPH":None,"WindFromDir":None,
+            "WindBlowingTo":None,"WindAngleToCF":None,"WindImpact":"Weather API Error","WindBoost":0,
+            "Dome":False,"WeatherScore":50,"WeatherSource":"Open-Meteo venue coordinates",
+            "WeatherStatus":f"Weather API error; venue coordinates known and neutral fallback used: {e}",
+            "WeatherTiedToVenue":True
+        }
 
 def get_or_create_ws(spreadsheet, title, rows=100, cols=30):
     try:
@@ -414,12 +466,12 @@ def build_model():
     or traded-player records from being attached to the wrong opponent, pitcher, venue,
     or weather record.
     """
-    sched_date = TODAY.isoformat()
-    print(f"Schedule date used for MLB feed: {sched_date} Pacific")
+    sched_date = SCHEDULE_DATE.isoformat()
+    print(f"Schedule date used for MLB feed: {sched_date} Eastern ({SCHEDULE_DATE_LOGIC})")
 
     sched = requests.get(
         "https://statsapi.mlb.com/api/v1/schedule",
-        params={"sportId": 1, "date": sched_date, "hydrate": "probablePitcher,team"},
+        params={"sportId": 1, "date": sched_date, "hydrate": "probablePitcher,team,venue"},
         timeout=30
     ).json()
 
@@ -455,11 +507,18 @@ def build_model():
 
             weather = get_weather_for_venue(venue)
 
+            playable_status = is_playable_game_status(status)
+            weather_tied = bool(weather.get("WeatherTiedToVenue", False))
+
             base = {
-                "ScheduleDatePacific": sched_date,
+                "ScheduleDateUsed": sched_date,
+                "ScheduleDateLogic": SCHEDULE_DATE_LOGIC,
+                "RunTimestampPacific": RUN_TIMESTAMP_LOCAL,
+                "RunTimestampEastern": RUN_TIMESTAMP_EASTERN,
                 "GamePk": game_pk,
                 "GameDateUTC": game_date,
                 "GameStatus": status,
+                "PlayableStatus": playable_status,
                 "Venue": venue,
                 "ParkFactor": park_factor(venue),
                 "HomeTeam": home,
@@ -471,12 +530,14 @@ def build_model():
 
             if away_id:
                 todays_team_ids.append(away_id)
-                verified = bool(game_pk and away_id and home_id and venue and home_p_id)
+                verified = bool(game_pk and away_id and home_id and venue and playable_status and home_p_id and weather_tied)
                 notes = []
                 if not game_pk: notes.append("missing gamePk")
                 if not home_id: notes.append("missing opponent team id")
                 if not venue: notes.append("missing venue")
+                if not playable_status: notes.append(f"unplayable game status: {status}")
                 if not home_p_id: notes.append("missing opposing probable pitcher")
+                if not weather_tied: notes.append(weather.get("WeatherStatus", "weather not tied to venue"))
                 matchups.append({
                     "Team ID": int(away_id),
                     "Team": away,
@@ -488,19 +549,21 @@ def build_model():
                     "PitcherSource": pitcher_source_label(home_p_id, home_p_name),
                     "PitcherConfidence": "High" if home_p_id else "Low",
                     "MatchupVerified": verified,
-                    "VerificationNotes": "Verified: GamePk+TeamID+OpponentID+Venue+ProbablePitcher" if verified else "; ".join(notes),
+                    "VerificationNotes": "Verified: OfficialSchedule+gamePk+Teams+PlayableStatus+Venue+ProbablePitcher+VenueWeather" if verified else "; ".join(notes),
                     "ScheduleIntegrityKey": f"{game_pk}:{away_id}:{home_id}:{home_p_id}:{venue}",
                     **base
                 })
 
             if home_id:
                 todays_team_ids.append(home_id)
-                verified = bool(game_pk and home_id and away_id and venue and away_p_id)
+                verified = bool(game_pk and home_id and away_id and venue and playable_status and away_p_id and weather_tied)
                 notes = []
                 if not game_pk: notes.append("missing gamePk")
                 if not away_id: notes.append("missing opponent team id")
                 if not venue: notes.append("missing venue")
+                if not playable_status: notes.append(f"unplayable game status: {status}")
                 if not away_p_id: notes.append("missing opposing probable pitcher")
+                if not weather_tied: notes.append(weather.get("WeatherStatus", "weather not tied to venue"))
                 matchups.append({
                     "Team ID": int(home_id),
                     "Team": home,
@@ -512,7 +575,7 @@ def build_model():
                     "PitcherSource": pitcher_source_label(away_p_id, away_p_name),
                     "PitcherConfidence": "High" if away_p_id else "Low",
                     "MatchupVerified": verified,
-                    "VerificationNotes": "Verified: GamePk+TeamID+OpponentID+Venue+ProbablePitcher" if verified else "; ".join(notes),
+                    "VerificationNotes": "Verified: OfficialSchedule+gamePk+Teams+PlayableStatus+Venue+ProbablePitcher+VenueWeather" if verified else "; ".join(notes),
                     "ScheduleIntegrityKey": f"{game_pk}:{home_id}:{away_id}:{away_p_id}:{venue}",
                     **base
                 })
@@ -626,7 +689,9 @@ def build_model():
         (model["PitcherKnown"] == True) &
         (model["RosterTeamVerified"] == True) &
         (model["GamePk"].astype(str).str.len() > 0) &
-        (model["Venue"].astype(str).str.len() > 0)
+        (model["Venue"].astype(str).str.len() > 0) &
+        (model["PlayableStatus"] == True) &
+        (model["WeatherTiedToVenue"] == True)
     )
 
     bad = model[model["HardVerified"] != True]
@@ -639,8 +704,16 @@ def build_model():
 
     for c in ["ERA", "WHIP", "K9", "PitcherVulnerability"]:
         model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf, -np.inf], 0).fillna(0)
-    for c in ["ParkFactor", "WeatherScore", "TempF", "Humidity", "WindMPH", "WindBoost"]:
-        model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf, -np.inf], 50).fillna(50)
+    numeric_defaults = {
+        "ParkFactor": 100,
+        "WeatherScore": 50,
+        "TempF": 70,
+        "Humidity": 50,
+        "WindMPH": 0,
+        "WindBoost": 0,
+    }
+    for c, default in numeric_defaults.items():
+        model[c] = pd.to_numeric(model[c], errors="coerce").replace([np.inf, -np.inf], default).fillna(default)
 
     model["Score"] = (
         norm(model["Season HR"]) * 0.07 +
@@ -1400,6 +1473,8 @@ def build_email_summary_rows(card):
     rows.append(["Daily MLB HR Targets - Professional Scouting Report"])
     rows.append(["Last Updated", RUN_TIMESTAMP_LOCAL])
     rows.append(["Model Version", MODEL_VERSION])
+    rows.append(["Schedule Date Used", SCHEDULE_DATE.isoformat()])
+    rows.append(["Schedule Date Logic", SCHEDULE_DATE_LOGIC])
     rows.append([])
 
     rows.extend(best_environment_summary(card))
@@ -1418,7 +1493,7 @@ def build_email_summary_rows(card):
     rows.append(["Ranking Basis", "Season power, recent HR form, hard-hit contact, 100+ MPH contact, fly-ball profile, pitcher matchup, park factor, and weather/wind."])
     rows.append(["Game Integrity", "Every target is tied to a verified scheduled game, venue, opposing pitcher, and weather record before ranking."])
     rows.append(["Inactive Player Filter", "Players not on active rosters are removed before scoring."])
-    rows.append(["Report Style", "V16.1 keeps the scoring engine locked and adds hard schedule/roster integrity verification."])
+    rows.append(["Report Style", "V16.2 keeps the scoring engine locked and fixes schedule-date integrity using the MLB Eastern slate date."])
     rows.append([])
     rows.append(["Results Tracking"])
     rows.append(["HR Result", "1 = HR, 0 = No HR."])
@@ -1511,7 +1586,10 @@ def refresh_run_log(sh, model, matchups, card):
     except Exception:
         pass
     rows = [
-        ["Run Timestamp", RUN_TIMESTAMP_LOCAL],
+        ["Run Timestamp Pacific", RUN_TIMESTAMP_LOCAL],
+        ["Run Timestamp Eastern", RUN_TIMESTAMP_EASTERN],
+        ["Schedule Date Used", SCHEDULE_DATE.isoformat()],
+        ["Schedule Date Logic", SCHEDULE_DATE_LOGIC],
         ["Model Version", MODEL_VERSION],
         ["Games / Team Records Verified", verified_games],
         ["Probable Pitchers Matched", verified_pitchers],
@@ -1553,22 +1631,23 @@ def write_to_sheet(model, matchups):
     ensure_header(results_ws, results_cols)
     results_ws.append_rows(clean_rows(results_rows), value_input_option="USER_ENTERED")
 
-    weather_cols = ["Date","Venue","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore"]
-    weather_log = matchups[["Venue","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore"]].drop_duplicates().copy()
-    weather_rows = [[TODAY.isoformat(), r["Venue"], r["TempF"], r["Humidity"], r["WindMPH"], r["WindFromDir"], r["WindBlowingTo"], r["WindAngleToCF"], r["WindImpact"], r["WindBoost"], str(r["Dome"]), r["WeatherScore"]] for _, r in weather_log.iterrows()]
+    weather_cols = ["Date","ScheduleDateUsed","Venue","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","WeatherSource","WeatherStatus","WeatherTiedToVenue"]
+    weather_log = matchups[["ScheduleDateUsed","Venue","TempF","Humidity","WindMPH","WindFromDir","WindBlowingTo","WindAngleToCF","WindImpact","WindBoost","Dome","WeatherScore","WeatherSource","WeatherStatus","WeatherTiedToVenue"]].drop_duplicates().copy()
+    weather_rows = [[TODAY.isoformat(), r["ScheduleDateUsed"], r["Venue"], r["TempF"], r["Humidity"], r["WindMPH"], r["WindFromDir"], r["WindBlowingTo"], r["WindAngleToCF"], r["WindImpact"], r["WindBoost"], str(r["Dome"]), r["WeatherScore"], r.get("WeatherSource",""), r.get("WeatherStatus",""), r.get("WeatherTiedToVenue","")] for _, r in weather_log.iterrows()]
     ensure_header(weather_ws, weather_cols)
     weather_ws.append_rows(clean_rows(weather_rows), value_input_option="USER_ENTERED")
 
 
-    integrity_cols = ["Date","Rank","Player","Team","Opponent","HomeAway","HomeTeam","AwayTeam","Venue","GamePk","GameDateUTC","GameStatus","Opposing Pitcher","Opposing Pitcher ID","PitcherSource","PitcherConfidence","MatchupVerified","VerificationNotes","TempF","WindMPH","WindImpact","WeatherScore","Dome"]
+    integrity_cols = ["Date","ScheduleDateUsed","ScheduleDateLogic","Rank","Player","Team","Opponent","HomeAway","HomeTeam","AwayTeam","Venue","GamePk","GameDateUTC","GameStatus","PlayableStatus","Opposing Pitcher","Opposing Pitcher ID","PitcherSource","PitcherConfidence","MatchupVerified","VerificationNotes","WeatherSource","WeatherStatus","WeatherTiedToVenue","TempF","WindMPH","WindImpact","WeatherScore","Dome"]
     integrity_rows = []
     for _, r in model.head(30).iterrows():
         integrity_rows.append([
-            TODAY.isoformat(), int(r.get("Rank",0)), r.get("Player",""), r.get("Team",""), r.get("Opponent",""), r.get("HomeAway",""),
+            TODAY.isoformat(), r.get("ScheduleDateUsed", SCHEDULE_DATE.isoformat()), r.get("ScheduleDateLogic", SCHEDULE_DATE_LOGIC),
+            int(r.get("Rank",0)), r.get("Player",""), r.get("Team",""), r.get("Opponent",""), r.get("HomeAway",""),
             r.get("HomeTeam",""), r.get("AwayTeam",""), r.get("Venue",""), r.get("GamePk",""), r.get("GameDateUTC",""), r.get("GameStatus",""),
-            r.get("Opposing Pitcher",""), r.get("Opposing Pitcher ID",""), r.get("PitcherSource",""), r.get("PitcherConfidence",""),
-            r.get("MatchupVerified",""), r.get("VerificationNotes",""), r.get("TempF",""), r.get("WindMPH",""), r.get("WindImpact",""),
-            r.get("WeatherScore",""), str(r.get("Dome",""))
+            r.get("PlayableStatus",""), r.get("Opposing Pitcher",""), r.get("Opposing Pitcher ID",""), r.get("PitcherSource",""), r.get("PitcherConfidence",""),
+            r.get("MatchupVerified",""), r.get("VerificationNotes",""), r.get("WeatherSource",""), r.get("WeatherStatus",""), r.get("WeatherTiedToVenue",""),
+            r.get("TempF",""), r.get("WindMPH",""), r.get("WindImpact",""), r.get("WeatherScore",""), str(r.get("Dome",""))
         ])
     ensure_header(integrity_ws, integrity_cols)
     integrity_ws.append_rows(clean_rows(integrity_rows), value_input_option="USER_ENTERED")
@@ -1577,18 +1656,21 @@ def write_to_sheet(model, matchups):
     summary_rows = [
         ["Daily MLB HR Picks Scorecard",""],
         ["Last Automated Run",RUN_TIMESTAMP_LOCAL],
+        ["Eastern Run Time",RUN_TIMESTAMP_EASTERN],
+        ["Schedule Date Used",SCHEDULE_DATE.isoformat()],
+        ["Schedule Date Logic",SCHEDULE_DATE_LOGIC],
         ["Model Version",MODEL_VERSION],
         ["Primary Picks",len(card[card["Tier"]=="Primary"])],
         ["Secondary Picks",len(card[card["Tier"]=="Secondary"])],
         ["Longshot Picks",len(card[card["Tier"]=="Longshot"])],
         ["Weather Status","Live weather + temperature + humidity + wind direction + outfield orientation"],
-        ["Pitcher Status","V16.1 requires verified opposing probable pitcher before scoring"],
+        ["Pitcher Status","V16.2 requires verified opposing probable pitcher before scoring"],
         ["Results Tracking","Manual HR Result remains: 1 = HR, 0 = No HR"],
-        ["Target Ranking","V16.1 polished, verified HR targets with confidence labels"],
+        ["Target Ranking","V16.2 verified HR targets with Eastern slate schedule-date fix"],
         ["HR Targets","HR Targets tab added"],
         ["Inactive Filter","Active roster filter plus verified game/team merge before scoring"],
         ["Game Integrity Log","Added to verify player, team, venue, pitcher, and weather binding"],
-        ["Email Summary","Email Summary tab upgraded for polished V16.1 report"],
+        ["Email Summary","Email Summary tab upgraded for polished V16.2 report"],
         ["Sheet Updated","Yes"],
     ]
     summary_ws.update(values=clean_rows(summary_rows), range_name=f"A1:B{len(summary_rows)}")
