@@ -2,9 +2,7 @@ name: Daily MLB HR Picks
 
 on:
   schedule:
-    # Runs at 6:50 AM Pacific during daylight time.
-    # GitHub schedules use UTC. 13:50 UTC = 6:50 AM PDT.
-    - cron: '50 13 * * *'
+    - cron: "05 13 * * *"  # 6:05 AM Pacific / 9:05 AM Eastern during MLB season
   workflow_dispatch:
 
 jobs:
