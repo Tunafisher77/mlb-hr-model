@@ -1,9 +1,9 @@
 name: Daily MLB Game Picks
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "20 14 * * *"
+    - cron: "10 13 * * *"  # 6:05 AM Pacific / 9:05 AM Eastern during MLB season
+  workflow_dispatch:
 
 jobs:
   run-game-model:
