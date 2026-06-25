@@ -2,7 +2,7 @@ name: Daily MLB HR Picks
 
 on:
   schedule:
-    - cron: "05 13 * * *"  # 6:05 AM Pacific / 9:05 AM Eastern during MLB season
+    - cron: "00 13 * * *"  # 6:00 AM Pacific / 9:00 AM Eastern during MLB season
   workflow_dispatch:
 
 jobs:
