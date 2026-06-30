@@ -36,12 +36,23 @@ jobs:
 
       - name: Send HR email
         env:
-          APPS_SCRIPT_EMAIL_WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_URL }}
-          APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN }}
+          WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN }}
         run: |
-          RESPONSE=$(curl -sS -X POST "$APPS_SCRIPT_EMAIL_WEBHOOK_URL" \
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "Missing APPS_SCRIPT_EMAIL_WEBHOOK_URL secret"
+            exit 1
+          fi
+
+          if [ -z "$WEBHOOK_TOKEN" ]; then
+            echo "Missing APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN secret"
+            exit 1
+          fi
+
+          RESPONSE=$(curl -L -sS -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d "{\"token\":\"$APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN\",\"report\":\"hr\"}")
+            -d "{\"token\":\"$WEBHOOK_TOKEN\",\"report\":\"hr\"}")
+
           echo "$RESPONSE"
           echo "$RESPONSE" | grep '"ok":true'
 
