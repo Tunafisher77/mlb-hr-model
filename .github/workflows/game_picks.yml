@@ -2,8 +2,7 @@ name: Daily MLB Game Picks
 
 on:
   schedule:
-    # 11:45 UTC = 4:45 AM Pacific during daylight time / 7:45 AM Eastern
-    # During standard time, this becomes 3:45 AM Pacific / 6:45 AM Eastern.
+    # 11:45 UTC = 4:45 AM Pacific / 7:45 AM Eastern during daylight time
     - cron: "45 11 * * *"
   workflow_dispatch:
 
@@ -32,7 +31,7 @@ jobs:
           python run_daily_mlb_game_picks.py
 
       - name: Send Game Picks email
-      env:
+        env:
           WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_URL }}
           WEBHOOK_TOKEN: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN }}
         run: |
