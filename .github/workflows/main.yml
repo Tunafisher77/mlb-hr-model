@@ -25,34 +25,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run MLB HR Model
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          ODDS_REGIONS: ${{ secrets.ODDS_REGIONS }}
-          ODDS_BOOKMAKERS: ${{ secrets.ODDS_BOOKMAKERS }}
-        run: |
-          python run_daily_mlb_hr_picks.py
-
-      - name: Send HR email
-        env:
-          WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_URL }}
-          WEBHOOK_TOKEN: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN }}
-        run: |
-          if [ -z "$WEBHOOK_URL" ]; then
-            echo "Missing APPS_SCRIPT_EMAIL_WEBHOOK_URL secret"
-            exit 1
-          fi
-
-          if [ -z "$WEBHOOK_TOKEN" ]; then
-            echo "Missing APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN secret"
-            exit 1
-          fi
-
-          RESPONSE=$(curl -L -sS -X POST "$WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"token\":\"$WEBHOOK_TOKEN\",\"report\":\"hr\"}")
-
-          echo "$RESPONSE"
-          echo "$RESPONSE" | grep '"ok":true'
+  
 
