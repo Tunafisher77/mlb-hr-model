@@ -23,31 +23,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Run MLB Game Picks Model
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          python run_daily_mlb_game_picks.py
-
       - name: Send Game Picks email
         env:
-          WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_URL }}
           WEBHOOK_TOKEN: ${{ secrets.APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN }}
         run: |
-          if [ -z "$WEBHOOK_URL" ]; then
-            echo "Missing APPS_SCRIPT_EMAIL_WEBHOOK_URL secret"
-            exit 1
-          fi
+          WEBHOOK_URL="https://script.google.com/macros/s/AKfycbz48FC4tSTWDV6QkUeo3DgAJR0Ro-YOaGtlSdkvNI39jn3Ix-R7fUzk5JOWG9aKKOih/exec"
 
           if [ -z "$WEBHOOK_TOKEN" ]; then
             echo "Missing APPS_SCRIPT_EMAIL_WEBHOOK_TOKEN secret"
             exit 1
           fi
 
-          RESPONSE=$(curl -L -sS -X POST "$WEBHOOK_URL" \
+          RESPONSE=$(curl -L --post302 --post303 -sS -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "{\"token\":\"$WEBHOOK_TOKEN\",\"report\":\"game\"}")
 
           echo "$RESPONSE"
+
           echo "$RESPONSE" | grep '"ok":true'
+
+       
+     
