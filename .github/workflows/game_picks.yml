@@ -2,7 +2,8 @@ name: Daily MLB Game Picks
 
 on:
   schedule:
-    # 11:45 UTC = 4:45 AM Pacific / 7:45 AM Eastern during daylight time
+    # Runs daily at 11:45 UTC
+    # During daylight time: 4:45 AM Pacific / 7:45 AM Eastern
     - cron: "45 11 * * *"
   workflow_dispatch:
 
@@ -29,6 +30,5 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           python run_daily_mlb_game_picks.py
-
        
      
