@@ -1,3 +1,4 @@
+import re
 import unittest
 from unittest.mock import patch
 
@@ -25,11 +26,23 @@ class FakeWorksheet:
         self.values.extend([list(row) for row in rows])
 
     def update(self, values, range_name=None):
-        if range_name and range_name.startswith("A1:"):
-            if self.values:
-                self.values[0] = list(values[0])
-            else:
-                self.values.append(list(values[0]))
+        match = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", range_name or "")
+        if not match:
+            return
+        start_letters, start_row, _, _ = match.groups()
+        start_column = 0
+        for letter in start_letters:
+            start_column = start_column * 26 + ord(letter) - 64
+        start_column -= 1
+        start_row = int(start_row) - 1
+        while len(self.values) <= start_row + len(values) - 1:
+            self.values.append([])
+        for row_offset, incoming in enumerate(values):
+            row = self.values[start_row + row_offset]
+            needed = start_column + len(incoming)
+            if len(row) < needed:
+                row.extend([""] * (needed - len(row)))
+            row[start_column:needed] = list(incoming)
 
 
 class FakeWorkbook:
@@ -64,12 +77,23 @@ def sample_feed(final=True, home_runs=1, plate_appearances=4):
             "linescore": {"teams": {"away": {"runs": 2}, "home": {"runs": 6}}},
             "boxscore": {
                 "teams": {
-                    "away": {"players": {}},
+                    "away": {
+                        "players": {
+                            "ID669203": {
+                                "person": {"id": 669203, "fullName": "Tarik Skubal"},
+                                "stats": {"pitching": {"inningsPitched": "7.0", "strikeOuts": 9}},
+                            }
+                        }
+                    },
                     "home": {
                         "players": {
                             "ID660271": {
                                 "person": {"id": 660271, "fullName": "Shohei Ohtani"},
-                                "stats": {"batting": {"plateAppearances": plate_appearances, "homeRuns": home_runs}},
+                                "stats": {"batting": {
+                                    "plateAppearances": plate_appearances, "atBats": 4, "hits": 2,
+                                    "doubles": 1, "triples": 0, "homeRuns": home_runs,
+                                    "rbi": 3,
+                                }},
                             }
                         }
                     },
@@ -96,6 +120,23 @@ class ResultsTrackerUnitTest(unittest.TestCase):
         }
         self.assertEqual(tracker.hr_prediction_id(record), tracker.hr_prediction_id(record))
         self.assertIn("823918", tracker.hr_prediction_id(record))
+
+    def test_player_prop_boxscore_values(self):
+        hitter = tracker.find_player_boxscore_by_id(sample_feed(), 660271, "Home")
+        hit_values = tracker.player_prop_boxscore_values(hitter, "Hits")
+        self.assertEqual(hit_values["Hits"], 2)
+        self.assertEqual(hit_values["Total Bases"], 6)
+        self.assertEqual(hit_values["RBIs"], 3)
+        self.assertTrue(hit_values["Appeared"])
+
+        pitcher = tracker.find_player_boxscore_by_id(sample_feed(), 669203, "Away")
+        strikeout_values = tracker.player_prop_boxscore_values(pitcher, "Strikeouts")
+        self.assertEqual(strikeout_values["Strikeouts"], 9)
+        self.assertTrue(strikeout_values["Appeared"])
+
+    def test_prop_prediction_id_uses_source_id(self):
+        record = {"Prediction ID": "published-prop-id"}
+        self.assertEqual(tracker.prop_prediction_id(record), "published-prop-id")
 
     def test_rank_tiers_match_production(self):
         self.assertEqual(tracker.tier_from_rank(3), "Primary")
@@ -134,6 +175,30 @@ class ResultsTrackerUnitTest(unittest.TestCase):
         self.assertEqual(tracker.snapshot_hr_picks(workbook, "2026-08-10"), 0)
         self.assertEqual(len(workbook.sheets[tracker.GAME_TRACKING_TAB].values), 2)
         self.assertEqual(len(workbook.sheets[tracker.HR_TRACKING_TAB].values), 2)
+
+    def test_player_prop_snapshot_is_idempotent(self):
+        workbook = FakeWorkbook({
+            "Player Props Email Summary": FakeWorksheet([
+                ["Model Version", "Player Props V1.1"],
+                ["Schedule Date Used", "2026-08-10"],
+            ]),
+            "Player Props": FakeWorksheet([
+                ["Prediction ID", "Date", "Model Version", "Report Rank", "Report Section", "Player Type", "Player ID", "Player", "Team", "Opponent", "GamePk", "Game", "HomeAway", "Venue", "Prop Type", "Threshold", "Recommended Prop", "Projected Probability", "Probability Gate", "Projected Mean", "Prop Score", "Confidence"],
+                ["prop-1", "2026-08-10", "Player Props V1.1", "1", "Top Props", "Hitter", "660271", "Shohei Ohtani", "LAD", "KC", "823918", "KC @ LAD", "Home", "Dodger Stadium", "Hits", "1", "Shohei Ohtani 1+ Hits", "73.0", "62", "1.12", "77.8", "Elite"],
+            ]),
+        })
+        self.assertEqual(tracker.snapshot_player_props(workbook, "2026-08-10"), 1)
+        self.assertEqual(tracker.snapshot_player_props(workbook, "2026-08-10"), 0)
+        self.assertEqual(len(workbook.sheets[tracker.PROP_TRACKING_TAB].values), 2)
+
+        graded = tracker.grade_player_prop_rows(workbook, {"823918": sample_feed()})
+        self.assertEqual(graded, 1)
+        result = tracker.rows_as_records(
+            workbook.sheets[tracker.PROP_TRACKING_TAB].get_all_values()
+        )[0]
+        self.assertEqual(result["Result Status"], "Final")
+        self.assertEqual(result["Actual Value"], 2)
+        self.assertEqual(result["Hit Prop?"], "Yes")
 
 
 if __name__ == "__main__":
