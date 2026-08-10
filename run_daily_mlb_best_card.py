@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from best_card_math import composite_stack_score, number, select_distinct_props, top_complete_stacks
 
 
-MODEL_VERSION = "Best Card V1.0 - Three-Stack Statistical Synthesis"
+MODEL_VERSION = "Best Card V1.0.1 - Duplicate Header Score Fix"
 MODEL_TIMEZONE = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
 DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
@@ -85,10 +85,16 @@ def normalized_game_pk(value: Any) -> str:
 def rows_as_records(values: list[list[str]]) -> list[dict[str, str]]:
     if not values:
         return []
-    headers = values[0]
+    header_index = {}
+    for index, header in enumerate(values[0]):
+        if header and header not in header_index:
+            header_index[header] = index
     records = []
     for row in values[1:]:
-        record = {header: row[index] if index < len(row) else "" for index, header in enumerate(headers) if header}
+        record = {
+            header: row[index] if index < len(row) else ""
+            for header, index in header_index.items()
+        }
         if any(clean_text(value) for value in record.values()):
             records.append(record)
     return records
