@@ -1,0 +1,13 @@
+{
+  "purpose": "Protect the two production selection models while downstream tracking is added.",
+  "files": {
+    ".github/workflows/game_picks.yml": "23a095b7837496cbf848f543e22987380093ed2b04a5a9c6d059144188df85a3",
+    ".github/workflows/main.yml": "aee5e3c4e0d1f2ff54375e533d3a4900a9d013f47d79ce988db8c454fbf064dc",
+    "run_daily_mlb_game_picks.py": "f2b50bf0e18e307a869cb8f3766107c1f5c02f964a81ad9021274ef06886f115",
+    "run_daily_mlb_hr_picks.py": "122b39c56d6f14b9482aa85500726a92c53780d6a3cf1d5a0d67a55f3938966f"
+  },
+  "model_versions": {
+    "game": "Game Picks V2.1.1 - Schedule Integrity Fix + Eastern Slate Date",
+    "hr": "Automated V16.2 - Eastern Slate Schedule Fix"
+  }
+}
