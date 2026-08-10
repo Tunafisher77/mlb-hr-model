@@ -1,0 +1,39 @@
+name: Daily MLB Best Card
+
+on:
+  schedule:
+    # Runs after HR, Game, and Player Props models.
+    - cron: "30 12 * * *"
+  workflow_dispatch:
+    inputs:
+      best_card_date:
+        description: "Optional source date in YYYY-MM-DD"
+        required: false
+        type: string
+
+jobs:
+  run-best-card-model:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_best_card.txt
+
+      - name: Verify all model safeguards
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Best Card Model
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          MLB_SCHEDULE_DATE: ${{ inputs.best_card_date || '' }}
+        run: python run_daily_mlb_best_card.py
