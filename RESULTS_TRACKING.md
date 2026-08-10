@@ -1,15 +1,15 @@
 # MLB Results Tracking
 
-This addition is deliberately downstream from the two production models.
+This addition is deliberately downstream from the Game, HR, and Player Props models.
 
 ## Non-interference boundary
 
 - `run_daily_mlb_game_picks.py` is unchanged.
 - `run_daily_mlb_hr_picks.py` is unchanged.
 - Their two existing GitHub Actions workflows are unchanged.
-- Apps Script and both email-summary tabs are unchanged.
+- Selection scripts, ranking logic, Apps Script, and email-summary tabs are not modified by grading.
 - No odds, sportsbook lines, implied probabilities, or market data are read.
-- The new tracker reads only already-published selections and official MLB results.
+- The tracker reads only already-published selections and official MLB results.
 
 `FROZEN_MODEL_BASELINE.json` and `tests/test_frozen_model_files.py` enforce this boundary.
 
@@ -17,6 +17,7 @@ This addition is deliberately downstream from the two production models.
 
 - `Tracking - Game Picks`: the seven Game Picks published in the email, plus official results.
 - `Tracking - HR Picks`: the nine HR targets/watchlist players published in the email, plus official results.
+- `Tracking - Player Props`: the 20 published Player Props, milestones, and official boxscore results.
 - `Tracking - Performance`: overall and segment-level accuracy/hit rate.
 - `Tracking - Run Log`: snapshot/grading status and counts.
 
@@ -36,7 +37,9 @@ optional `YYYY-MM-DD` snapshot date.
 
 - Final game winners are graded Yes/No.
 - HR targets are graded from the official game boxscore.
+- Hits, total bases, RBIs, and pitcher strikeouts are graded against their published dynamic thresholds.
 - A player with no plate appearance is marked `DNP`, not a miss.
+- A strikeout target with no innings pitched is marked `DNP`, not a miss.
 - An unmatched player is marked `DNP/Unmatched`, not a miss, and retained for review.
 - Postponed or cancelled games are marked `Void`.
 - Non-final games remain `Pending`.
