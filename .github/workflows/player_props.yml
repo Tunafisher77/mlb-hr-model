@@ -1,0 +1,33 @@
+name: Daily MLB Player Props
+
+on:
+  schedule:
+    # Runs after the frozen HR and Game models.
+    - cron: "0 12 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-player-props-model:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_player_props.txt
+
+      - name: Verify frozen production models
+        run: python -m unittest discover -s tests -v
+
+      - name: Run Player Props Model
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python run_daily_mlb_player_props.py
