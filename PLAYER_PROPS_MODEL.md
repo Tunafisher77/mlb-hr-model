@@ -45,9 +45,11 @@ Reliability gates:
 
 - Twelve top props
 - Eight watchlist props
+- Best-in-category spotlights sourced from the full eligible pool
 - Maximum two props per player
 - Maximum three props per game
 - No fixed quota by prop category; the strongest statistical profiles rank first
+- Full eligible candidate history retained for auditing and later results analysis
 
 Morning reports verify active-roster status and expected playing time. They do not
 claim confirmed lineup status when official starting lineups are not yet available.

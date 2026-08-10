@@ -487,17 +487,25 @@ def append_unique(worksheet, headers, rows):
     if new_rows: worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
 
 
-def build_email_rows(card):
+def build_email_rows(card, model):
     rows = [
         ["Daily MLB Player Props - Dynamic Statistical Milestones"], ["Last Updated", RUN_LOCAL],
         ["Model Version", MODEL_VERSION], ["Schedule Date Used", TODAY.isoformat()], ["Schedule Date Logic", DATE_LOGIC], [],
-        ["Daily Outlook"], ["Verified Props Evaluated", len(card)],
+        ["Daily Outlook"], ["Verified Props Evaluated", len(model)],
         ["Top Overall Prop", card.iloc[0]["Recommended Prop"] + " - " + card.iloc[0]["Confidence"]],
         ["Selection Method", "Highest statistically supported milestone; no sportsbook or market information."],
     ]
+    rows.extend([[], ["Category Leaders"]])
     for prop_type in ["Hits", "Total Bases", "RBIs", "Strikeouts"]:
-        subset = card[card["Prop Type"] == prop_type]
-        if not subset.empty: rows.append([f"Best {prop_type}", subset.iloc[0]["Recommended Prop"]])
+        subset = model[model["Prop Type"] == prop_type]
+        if subset.empty:
+            rows.append([f"Best {prop_type}", "No candidate cleared the statistical reliability gate."])
+        else:
+            leader = subset.iloc[0]
+            rows.append([
+                f"Best {prop_type}",
+                f"{leader['Recommended Prop']} | {leader['Projected Probability']:.1f}% | {leader['Confidence']}",
+            ])
     for section in ["Top Props", "Watchlist"]:
         rows.extend([[], [section]])
         for _, prop in card[card["Report Section"] == section].iterrows():
@@ -537,8 +545,8 @@ def write_to_sheet(model, card, integrity):
     current_rows = card.to_dict("records")
     current_ws.clear()
     current_ws.update(values=[headers] + [[row.get(header, "") for header in headers] for row in current_rows], range_name=f"A1:{column_letter(len(headers))}{len(current_rows)+1}")
-    append_unique(history_ws, headers, model.head(60).to_dict("records"))
-    email_rows = build_email_rows(card)
+    append_unique(history_ws, headers, model.to_dict("records"))
+    email_rows = build_email_rows(card, model)
     email_ws.clear(); email_ws.update(values=email_rows, range_name=f"A1:B{len(email_rows)}")
     integrity_headers = list(integrity.columns)
     integrity_ws.clear(); integrity_ws.update(values=[integrity_headers] + integrity.fillna("").values.tolist(), range_name=f"A1:{column_letter(len(integrity_headers))}{len(integrity)+1}")
