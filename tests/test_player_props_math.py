@@ -6,6 +6,7 @@ from player_props_math import (
     compound_total_bases_tail,
     parse_baseball_innings,
     poisson_tail,
+    prop_strength_score,
     select_limited_indices,
 )
 
@@ -43,6 +44,17 @@ class PlayerPropsMathTest(unittest.TestCase):
             self.assertLessEqual(sum(row["Player ID"] == player_id for row in chosen), 2)
         for game_pk in {row["GamePk"] for row in chosen}:
             self.assertLessEqual(sum(row["GamePk"] == game_pk for row in chosen), 3)
+
+    def test_cross_category_score_does_not_overweight_total_bases(self):
+        total_bases = prop_strength_score(0.311, 0.24, 4, 3.0)
+        two_hits = prop_strength_score(0.38, 0.32, 2, 4.0)
+        self.assertLess(abs(total_bases - two_hits), 4.0)
+
+    def test_more_reliable_prop_scores_higher_at_same_gate(self):
+        self.assertGreater(
+            prop_strength_score(0.50, 0.38, 1, 3.0),
+            prop_strength_score(0.42, 0.38, 1, 3.0),
+        )
 
 
 if __name__ == "__main__":
