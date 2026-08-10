@@ -27,16 +27,16 @@ from player_props_math import (
 )
 
 
-MODEL_VERSION = "Player Props V1.0 - Dynamic Stats-Only Milestones"
+MODEL_VERSION = "Player Props V1.1 - Cross-Category Dynamic Calibration"
 MODEL_TIMEZONE = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
 DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 
-HITS_GATES = {1: 0.60, 2: 0.28, 3: 0.10}
-TOTAL_BASES_GATES = {2: 0.35, 3: 0.20, 4: 0.12}
-RBI_GATES = {1: 0.30, 2: 0.12, 3: 0.05}
-STRIKEOUT_GATES = {4: 0.80, 5: 0.70, 6: 0.58, 7: 0.45, 8: 0.33, 9: 0.23, 10: 0.15}
+HITS_GATES = {1: 0.62, 2: 0.32, 3: 0.14}
+TOTAL_BASES_GATES = {2: 0.48, 3: 0.34, 4: 0.24}
+RBI_GATES = {1: 0.38, 2: 0.16, 3: 0.07}
+STRIKEOUT_GATES = {4: 0.78, 5: 0.68, 6: 0.58, 7: 0.48, 8: 0.38, 9: 0.29, 10: 0.21}
 
 PARK_FACTORS = {
     "Coors Field":120, "Great American Ball Park":114, "Yankee Stadium":111,
@@ -328,9 +328,9 @@ def matchup_adjusted_outcomes(hitter, pitcher, park, weather):
 
 
 def confidence_label(score):
-    if score >= 82: return "★★★★★ Elite Prop"
-    if score >= 72: return "★★★★ Strong Prop"
-    if score >= 64: return "★★★ Solid Prop"
+    if score >= 76: return "★★★★★ Elite Prop"
+    if score >= 70: return "★★★★ Strong Prop"
+    if score >= 65: return "★★★ Solid Prop"
     return "★★ Watchlist"
 
 

@@ -1,4 +1,4 @@
-# MLB Player Props V1.0
+# MLB Player Props V1.1
 
 ## Purpose
 
@@ -12,8 +12,16 @@ selects the highest milestone that clears its category-specific reliability gate
 Examples include 1+/2+/3+ hits and 4+ through 10+ strikeouts.
 
 The threshold gates normalize categories with different natural frequencies. The
-final ranking uses gate clearance plus a controlled difficulty bonus. No sportsbook
+final ranking combines absolute reliability, gate clearance, and a controlled
+difficulty bonus. No sportsbook
 line defines the milestone and no market information enters the score.
+
+Reliability gates:
+
+- Hits: 1+ at 62%, 2+ at 32%, 3+ at 14%
+- Total bases: 2+ at 48%, 3+ at 34%, 4+ at 24%
+- RBIs: 1+ at 38%, 2+ at 16%, 3+ at 7%
+- Strikeouts: 4+ through 10+ at 78%, 68%, 58%, 48%, 38%, 29%, and 21%
 
 ## Inputs
 

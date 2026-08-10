@@ -90,9 +90,14 @@ def choose_dynamic_milestone(
 
 
 def prop_strength_score(probability: float, gate: float, threshold: int, difficulty_step: float) -> float:
-    """Comparable score after category-specific probability gates normalize difficulty."""
+    """Cross-category score balancing reliability, gate clearance, and milestone difficulty."""
+    probability = clamp(probability, 0.0, 1.0)
+    gate = clamp(gate, 0.0, 1.0)
     clearance = max(0.0, probability - gate)
-    score = 62.0 + clearance * 110.0 + max(0, threshold - 1) * difficulty_step
+    reliability_component = probability * 12.0
+    clearance_component = clearance * 100.0
+    difficulty_component = max(0, threshold - 1) * difficulty_step * 0.35
+    score = 58.0 + reliability_component + clearance_component + difficulty_component
     return round(clamp(score, 0.0, 99.0), 2)
 
 
