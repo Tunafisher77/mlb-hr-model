@@ -1,6 +1,7 @@
 import unittest
 
 from best_card_math import composite_stack_score, select_distinct_props, top_complete_stacks
+from run_daily_mlb_best_card import rows_as_records
 
 
 class BestCardMathTest(unittest.TestCase):
@@ -25,6 +26,13 @@ class BestCardMathTest(unittest.TestCase):
             {"GamePk": "3", "Complete": True, "Stack Score": 78, "Win Probability": 79, "HR Score": 72},
         ]
         self.assertEqual([row["GamePk"] for row in top_complete_stacks(stacks)], ["3", "1"])
+
+    def test_duplicate_headers_keep_first_populated_value(self):
+        values = [
+            ["Player", "Score", "Score"],
+            ["Junior Caminero", "72.76", ""],
+        ]
+        self.assertEqual(rows_as_records(values)[0]["Score"], "72.76")
 
 
 if __name__ == "__main__":
