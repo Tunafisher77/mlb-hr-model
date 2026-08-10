@@ -489,11 +489,15 @@ def as_baseball_innings(value: Any) -> float:
     return innings + (outs / 3.0 if outs in {0, 1, 2} else 0.0)
 
 
-def update_result_fields(worksheet, headers: list[str], row_number: int, updates: dict[str, Any]):
+def update_result_fields(
+    worksheet,
+    headers: list[str],
+    row_number: int,
+    updates: dict[str, Any],
+    record: dict[str, Any] | None = None,
+):
     indices = {header: index + 1 for index, header in enumerate(headers)}
-    current = worksheet.row_values(row_number)
-    if len(current) < len(headers):
-        current.extend([""] * (len(headers) - len(current)))
+    current = [clean((record or {}).get(header, "")) for header in headers]
     for header, value in updates.items():
         current[indices[header] - 1] = clean(value)
     first_column = min(indices[header] for header in updates)
@@ -527,11 +531,11 @@ def grade_game_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
             update_result_fields(worksheet, GAME_HEADERS, offset, {
                 "Result Status": "Void", "Game Status": detailed,
                 "Graded At UTC": utc_now_text(), "Result Source": RESULT_SOURCE,
-            })
+            }, record)
             graded += 1
             continue
         if not is_final(feed):
-            update_result_fields(worksheet, GAME_HEADERS, offset, {"Game Status": detailed})
+            update_result_fields(worksheet, GAME_HEADERS, offset, {"Game Status": detailed}, record)
             continue
         away, home, away_runs, home_runs, winner = final_score(feed)
         projected = normalized_id_piece(record.get("Projected Winner", ""))
@@ -541,7 +545,7 @@ def grade_game_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
             "Correct?": correct, "Final Score": f"{away} {away_runs} - {home} {home_runs}",
             "Away Runs": away_runs, "Home Runs": home_runs, "Graded At UTC": utc_now_text(),
             "Result Source": RESULT_SOURCE,
-        })
+        }, record)
         graded += 1
     return graded
 
@@ -563,11 +567,11 @@ def grade_hr_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
             update_result_fields(worksheet, HR_HEADERS, offset, {
                 "Result Status": "Void", "Game Status": detailed,
                 "Graded At UTC": utc_now_text(), "Result Source": RESULT_SOURCE,
-            })
+            }, record)
             graded += 1
             continue
         if not is_final(feed):
-            update_result_fields(worksheet, HR_HEADERS, offset, {"Game Status": detailed})
+            update_result_fields(worksheet, HR_HEADERS, offset, {"Game Status": detailed}, record)
             continue
         player = find_player_boxscore(feed, record.get("Player", ""), record.get("HomeAway", ""))
         if not player:
@@ -575,7 +579,7 @@ def grade_hr_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
                 "Result Status": "DNP/Unmatched", "Game Status": detailed,
                 "Graded At UTC": utc_now_text(), "Result Source": RESULT_SOURCE,
                 "Notes": "No unique player match in the official boxscore; not graded as a miss.",
-            })
+            }, record)
             graded += 1
             continue
         person = player.get("person", {}) or {}
@@ -591,7 +595,7 @@ def grade_hr_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
             "Matched Player ID": person.get("id", ""), "Plate Appearances": plate_appearances,
             "Home Runs": home_runs, "Hit HR?": hit_hr, "Graded At UTC": utc_now_text(),
             "Result Source": RESULT_SOURCE,
-        })
+        }, record)
         graded += 1
     return graded
 
@@ -612,11 +616,11 @@ def grade_player_prop_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> i
             update_result_fields(worksheet, PROP_HEADERS, offset, {
                 "Result Status": "Void", "Game Status": detailed,
                 "Graded At UTC": utc_now_text(), "Result Source": RESULT_SOURCE,
-            })
+            }, record)
             graded += 1
             continue
         if not is_final(feed):
-            update_result_fields(worksheet, PROP_HEADERS, offset, {"Game Status": detailed})
+            update_result_fields(worksheet, PROP_HEADERS, offset, {"Game Status": detailed}, record)
             continue
         player = find_player_boxscore_by_id(feed, record.get("Player ID"), record.get("HomeAway", ""))
         if not player:
@@ -626,7 +630,7 @@ def grade_player_prop_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> i
                 "Result Status": "DNP/Unmatched", "Game Status": detailed,
                 "Graded At UTC": utc_now_text(), "Result Source": RESULT_SOURCE,
                 "Notes": "No unique player match in the official boxscore; not graded as a miss.",
-            })
+            }, record)
             graded += 1
             continue
         try:
@@ -636,7 +640,7 @@ def grade_player_prop_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> i
                 "Result Status": "Error", "Game Status": detailed,
                 "Graded At UTC": utc_now_text(), "Result Source": RESULT_SOURCE,
                 "Notes": str(error),
-            })
+            }, record)
             graded += 1
             continue
         person = player.get("person", {}) or {}
@@ -649,7 +653,7 @@ def grade_player_prop_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> i
             "Result Status": result_status, "Game Status": detailed,
             "Matched Player ID": person.get("id", ""), **values, "Hit Prop?": hit_prop,
             "Graded At UTC": utc_now_text(), "Result Source": RESULT_SOURCE,
-        })
+        }, record)
         graded += 1
     return graded
 
@@ -690,9 +694,9 @@ def performance_rows(workbook) -> list[list[Any]]:
 
 
 def refresh_performance(workbook):
-    headers = performance_rows(workbook)[0]
-    worksheet = get_or_create_sheet(workbook, PERFORMANCE_TAB, headers, rows=500)
     rows = performance_rows(workbook)
+    headers = rows[0]
+    worksheet = get_or_create_sheet(workbook, PERFORMANCE_TAB, headers, rows=500)
     worksheet.clear()
     worksheet.update(values=rows, range_name=f"A1:H{len(rows)}")
 
