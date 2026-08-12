@@ -29,9 +29,11 @@ MLB_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
 GAME_SOURCE_TAB = "Game Picks"
 HR_SOURCE_TAB = "Model Results"
 PROP_SOURCE_TAB = "Player Props"
+BEST_CARD_SOURCE_TAB = "Best Card"
 GAME_TRACKING_TAB = "Tracking - Game Picks"
 HR_TRACKING_TAB = "Tracking - HR Picks"
 PROP_TRACKING_TAB = "Tracking - Player Props"
+BEST_CARD_TRACKING_TAB = "Tracking - Best Card"
 PERFORMANCE_TAB = "Tracking - Performance"
 RUN_LOG_TAB = "Tracking - Run Log"
 
@@ -64,6 +66,26 @@ PROP_HEADERS = [
     "Game Status", "Matched Player ID", "Plate Appearances", "At Bats", "Hits",
     "Total Bases", "RBIs", "Innings Pitched", "Strikeouts", "Actual Value",
     "Hit Prop?", "Graded At UTC", "Result Source", "Notes",
+]
+
+BEST_CARD_HEADERS = [
+    "Prediction ID", "Date", "Model Version", "Card Rank", "GamePk", "Game",
+    "Venue", "Projected Winner", "Win Probability", "HR Player", "HR Team",
+    "HR Rank", "HR Candidate Source", "Prop 1 Player", "Prop 1 Type",
+    "Prop 1 Threshold", "Prop 1 Pick", "Prop 1 Prediction ID", "Prop 2 Player",
+    "Prop 2 Type", "Prop 2 Threshold", "Prop 2 Pick", "Prop 2 Prediction ID",
+    "Stack Score", "Published Source", "Snapshot Timestamp UTC", "Result Status",
+    "Game Status", "Actual Winner", "Winner Correct?", "Final Score",
+    "HR Component Status", "HR Matched Player ID", "HR Plate Appearances",
+    "HR Home Runs", "HR Hit?", "Prop 1 Component Status", "Prop 1 Matched Player ID",
+    "Prop 1 Plate Appearances", "Prop 1 At Bats", "Prop 1 Hits",
+    "Prop 1 Total Bases", "Prop 1 RBIs", "Prop 1 Innings Pitched",
+    "Prop 1 Strikeouts", "Prop 1 Actual Value", "Prop 1 Hit?",
+    "Prop 2 Component Status", "Prop 2 Matched Player ID", "Prop 2 Plate Appearances",
+    "Prop 2 At Bats", "Prop 2 Hits", "Prop 2 Total Bases", "Prop 2 RBIs",
+    "Prop 2 Innings Pitched", "Prop 2 Strikeouts", "Prop 2 Actual Value",
+    "Prop 2 Hit?", "Components Graded", "Components Hit", "Perfect Stack?",
+    "Graded At UTC", "Result Source", "Notes",
 ]
 
 RESULT_SOURCE = "MLB Stats API live game feed"
@@ -269,6 +291,20 @@ def prop_prediction_id(record: dict[str, str]) -> str:
     )
 
 
+def best_card_prediction_id(record: dict[str, str]) -> str:
+    existing = str(record.get("Prediction ID", "")).strip()
+    if existing:
+        return existing
+    return "|".join(
+        [
+            "BESTCARD",
+            record.get("Date", ""),
+            record.get("GamePk", ""),
+            normalized_id_piece(record.get("Model Version", "")),
+        ]
+    )
+
+
 def tier_from_rank(rank: int) -> str:
     if rank <= 3:
         return "Primary"
@@ -383,6 +419,48 @@ def snapshot_player_props(workbook, target_date: str) -> int:
         candidates.append(item)
     tracking = get_or_create_sheet(workbook, PROP_TRACKING_TAB, PROP_HEADERS, rows=10000)
     return append_new_rows(tracking, PROP_HEADERS, candidates)
+
+
+def snapshot_best_card(workbook, target_date: str) -> int:
+    summary_date = summary_value(workbook, "Best Card Email Summary", "Schedule Date Used")
+    published_version = summary_value(workbook, "Best Card Email Summary", "Model Version")
+    if summary_date != target_date:
+        raise RuntimeError(
+            f"Best Card Email Summary is not fresh for {target_date}; "
+            f"found {summary_date or 'missing'}."
+        )
+    source = worksheet_by_title(workbook, BEST_CARD_SOURCE_TAB)
+    records = rows_as_records(quota_retry(source.get_all_values))
+    candidates = []
+    for record in records:
+        card_rank = as_int(record.get("Card Rank"))
+        if record.get("Date") != target_date or not 1 <= card_rank <= 3:
+            continue
+        if published_version and record.get("Model Version") != published_version:
+            continue
+        if not record.get("GamePk") or not record.get("HR Player"):
+            continue
+        if not record.get("Prop 1 Player") or not record.get("Prop 2 Player"):
+            continue
+        item = {header: "" for header in BEST_CARD_HEADERS}
+        for header in BEST_CARD_HEADERS:
+            if header in record:
+                item[header] = record[header]
+        item.update(
+            {
+                "Prediction ID": best_card_prediction_id(record),
+                "Published Source": BEST_CARD_SOURCE_TAB,
+                "Snapshot Timestamp UTC": utc_now_text(),
+                "Result Status": "Pending",
+            }
+        )
+        candidates.append(item)
+    if len(candidates) != 3:
+        raise RuntimeError(
+            f"Best Card snapshot found {len(candidates)} published stacks for {target_date}; exactly 3 required."
+        )
+    tracking = get_or_create_sheet(workbook, BEST_CARD_TRACKING_TAB, BEST_CARD_HEADERS, rows=5000)
+    return append_new_rows(tracking, BEST_CARD_HEADERS, candidates)
 
 
 def fetch_game_feed(game_pk: str, attempts: int = 3) -> dict[str, Any]:
@@ -693,6 +771,150 @@ def grade_player_prop_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> i
     return graded
 
 
+def grade_hr_component(feed: dict[str, Any], player_name: str) -> dict[str, Any]:
+    player = find_player_boxscore(feed, player_name)
+    if not player:
+        return {
+            "Status": "DNP/Unmatched", "Matched Player ID": "",
+            "Plate Appearances": "", "Home Runs": "", "Hit?": "",
+        }
+    person = player.get("person", {}) or {}
+    batting = player.get("stats", {}).get("batting", {}) or {}
+    plate_appearances = as_int(batting.get("plateAppearances"), as_int(batting.get("atBats")))
+    home_runs = as_int(batting.get("homeRuns"))
+    if plate_appearances <= 0:
+        status, hit = "DNP", ""
+    else:
+        status, hit = "Final", "Yes" if home_runs >= 1 else "No"
+    return {
+        "Status": status, "Matched Player ID": person.get("id", ""),
+        "Plate Appearances": plate_appearances, "Home Runs": home_runs, "Hit?": hit,
+    }
+
+
+def grade_prop_component(
+    feed: dict[str, Any], player_name: str, prop_type: str, threshold: Any
+) -> dict[str, Any]:
+    player = find_player_boxscore(feed, player_name)
+    if not player:
+        return {
+            "Status": "DNP/Unmatched", "Matched Player ID": "", "Hit?": "",
+        }
+    person = player.get("person", {}) or {}
+    try:
+        values = player_prop_boxscore_values(player, prop_type)
+    except ValueError as error:
+        return {
+            "Status": "Error", "Matched Player ID": person.get("id", ""),
+            "Hit?": "", "Notes": str(error),
+        }
+    appeared = values.pop("Appeared")
+    if not appeared:
+        status, hit = "DNP", ""
+    else:
+        status = "Final"
+        hit = "Yes" if as_int(values["Actual Value"]) >= as_int(threshold) else "No"
+    return {
+        "Status": status, "Matched Player ID": person.get("id", ""),
+        **values, "Hit?": hit,
+    }
+
+
+def grade_best_card_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
+    worksheet = get_or_create_sheet(
+        workbook, BEST_CARD_TRACKING_TAB, BEST_CARD_HEADERS, rows=5000
+    )
+    records = rows_as_records(quota_retry(worksheet.get_all_values))
+    graded = 0
+    for offset, record in enumerate(records, start=2):
+        if record.get("Result Status") not in {"", "Pending", "Error"}:
+            continue
+        game_pk = str(record.get("GamePk", "")).strip()
+        if not game_pk:
+            continue
+        feed = cached_feed(feed_cache, game_pk)
+        _, _, detailed = game_status(feed)
+        if is_void(feed):
+            update_result_fields(worksheet, BEST_CARD_HEADERS, offset, {
+                "Result Status": "Void", "Game Status": detailed,
+                "Graded At UTC": utc_now_text(), "Result Source": RESULT_SOURCE,
+            }, record)
+            graded += 1
+            continue
+        if not is_final(feed):
+            update_result_fields(
+                worksheet, BEST_CARD_HEADERS, offset, {"Game Status": detailed}, record
+            )
+            continue
+
+        away, home, away_runs, home_runs, winner = final_score(feed)
+        winner_hit = (
+            "Yes" if normalized_id_piece(record.get("Projected Winner", ""))
+            == normalized_id_piece(winner) else "No"
+        )
+        hr = grade_hr_component(feed, record.get("HR Player", ""))
+        prop_one = grade_prop_component(
+            feed, record.get("Prop 1 Player", ""), record.get("Prop 1 Type", ""),
+            record.get("Prop 1 Threshold"),
+        )
+        prop_two = grade_prop_component(
+            feed, record.get("Prop 2 Player", ""), record.get("Prop 2 Type", ""),
+            record.get("Prop 2 Threshold"),
+        )
+        component_results = [winner_hit, hr.get("Hit?", ""), prop_one.get("Hit?", ""), prop_two.get("Hit?", "")]
+        components_graded = sum(value in {"Yes", "No"} for value in component_results)
+        components_hit = sum(value == "Yes" for value in component_results)
+        component_statuses = [hr.get("Status"), prop_one.get("Status"), prop_two.get("Status")]
+        if components_graded == 4:
+            result_status = "Final"
+            perfect = "Yes" if components_hit == 4 else "No"
+        elif "DNP/Unmatched" in component_statuses:
+            result_status, perfect = "DNP/Unmatched", ""
+        elif "DNP" in component_statuses:
+            result_status, perfect = "DNP", ""
+        else:
+            result_status, perfect = "Error", ""
+        notes = "; ".join(
+            value for value in [prop_one.get("Notes", ""), prop_two.get("Notes", "")] if value
+        )
+        update_result_fields(worksheet, BEST_CARD_HEADERS, offset, {
+            "Result Status": result_status, "Game Status": detailed,
+            "Actual Winner": winner, "Winner Correct?": winner_hit,
+            "Final Score": f"{away} {away_runs} - {home} {home_runs}",
+            "HR Component Status": hr.get("Status", ""),
+            "HR Matched Player ID": hr.get("Matched Player ID", ""),
+            "HR Plate Appearances": hr.get("Plate Appearances", ""),
+            "HR Home Runs": hr.get("Home Runs", ""), "HR Hit?": hr.get("Hit?", ""),
+            "Prop 1 Component Status": prop_one.get("Status", ""),
+            "Prop 1 Matched Player ID": prop_one.get("Matched Player ID", ""),
+            "Prop 1 Plate Appearances": prop_one.get("Plate Appearances", ""),
+            "Prop 1 At Bats": prop_one.get("At Bats", ""),
+            "Prop 1 Hits": prop_one.get("Hits", ""),
+            "Prop 1 Total Bases": prop_one.get("Total Bases", ""),
+            "Prop 1 RBIs": prop_one.get("RBIs", ""),
+            "Prop 1 Innings Pitched": prop_one.get("Innings Pitched", ""),
+            "Prop 1 Strikeouts": prop_one.get("Strikeouts", ""),
+            "Prop 1 Actual Value": prop_one.get("Actual Value", ""),
+            "Prop 1 Hit?": prop_one.get("Hit?", ""),
+            "Prop 2 Component Status": prop_two.get("Status", ""),
+            "Prop 2 Matched Player ID": prop_two.get("Matched Player ID", ""),
+            "Prop 2 Plate Appearances": prop_two.get("Plate Appearances", ""),
+            "Prop 2 At Bats": prop_two.get("At Bats", ""),
+            "Prop 2 Hits": prop_two.get("Hits", ""),
+            "Prop 2 Total Bases": prop_two.get("Total Bases", ""),
+            "Prop 2 RBIs": prop_two.get("RBIs", ""),
+            "Prop 2 Innings Pitched": prop_two.get("Innings Pitched", ""),
+            "Prop 2 Strikeouts": prop_two.get("Strikeouts", ""),
+            "Prop 2 Actual Value": prop_two.get("Actual Value", ""),
+            "Prop 2 Hit?": prop_two.get("Hit?", ""),
+            "Components Graded": components_graded, "Components Hit": components_hit,
+            "Perfect Stack?": perfect, "Graded At UTC": utc_now_text(),
+            "Result Source": RESULT_SOURCE, "Notes": notes,
+        }, record)
+        graded += 1
+    return graded
+
+
 def performance_rows(workbook) -> list[list[Any]]:
     rows: list[list[Any]] = [["Model", "Segment", "Graded", "Correct/Hits", "Accuracy", "Pending", "Void/DNP", "Last Updated UTC"]]
     for model, tab, result_field, success_value in [
@@ -726,6 +948,34 @@ def performance_rows(workbook) -> list[list[Any]]:
             excluded = sum(r.get("Result Status") in {"Void", "DNP", "DNP/Unmatched"} for r in segment_rows)
             accuracy = f"{successes / len(graded_rows):.1%}" if graded_rows else ""
             rows.append([model, segment, len(graded_rows), successes, accuracy, pending, excluded, utc_now_text()])
+
+    try:
+        worksheet = worksheet_by_title(workbook, BEST_CARD_TRACKING_TAB)
+        best_card_records = rows_as_records(quota_retry(worksheet.get_all_values))
+    except Exception as error:
+        if error.__class__.__name__ != "WorksheetNotFound":
+            raise
+        best_card_records = []
+    best_card_segments = [
+        ("Complete Stacks", "Perfect Stack?"),
+        ("Game Winners", "Winner Correct?"),
+        ("Home Runs", "HR Hit?"),
+        ("Player Prop 1", "Prop 1 Hit?"),
+        ("Player Prop 2", "Prop 2 Hit?"),
+    ]
+    for segment, result_field in best_card_segments:
+        graded_rows = [r for r in best_card_records if r.get(result_field) in {"Yes", "No"}]
+        successes = sum(r.get(result_field) == "Yes" for r in graded_rows)
+        pending = sum(r.get("Result Status") in {"", "Pending", "Error"} for r in best_card_records)
+        excluded = sum(
+            r.get("Result Status") in {"Void", "DNP", "DNP/Unmatched"}
+            for r in best_card_records
+        )
+        accuracy = f"{successes / len(graded_rows):.1%}" if graded_rows else ""
+        rows.append([
+            "Best Card", segment, len(graded_rows), successes, accuracy, pending,
+            excluded, utc_now_text(),
+        ])
     return rows
 
 
@@ -748,18 +998,21 @@ def run(mode: str, target_date: str) -> dict[str, int]:
     workbook = client.open(SHEET_NAME)
     counts = {
         "game_snapshots": 0, "hr_snapshots": 0, "prop_snapshots": 0,
-        "game_graded": 0, "hr_graded": 0, "prop_graded": 0,
+        "best_card_snapshots": 0, "game_graded": 0, "hr_graded": 0,
+        "prop_graded": 0, "best_card_graded": 0,
     }
     try:
         if mode in {"snapshot", "both"}:
             counts["game_snapshots"] = snapshot_game_picks(workbook, target_date)
             counts["hr_snapshots"] = snapshot_hr_picks(workbook, target_date)
             counts["prop_snapshots"] = snapshot_player_props(workbook, target_date)
+            counts["best_card_snapshots"] = snapshot_best_card(workbook, target_date)
         if mode in {"grade", "both"}:
             cache: dict[str, dict[str, Any]] = {}
             counts["game_graded"] = grade_game_rows(workbook, cache)
             counts["hr_graded"] = grade_hr_rows(workbook, cache)
             counts["prop_graded"] = grade_player_prop_rows(workbook, cache)
+            counts["best_card_graded"] = grade_best_card_rows(workbook, cache)
         refresh_performance(workbook)
         append_run_log(workbook, mode, target_date, json.dumps(counts, sort_keys=True), "Completed")
         return counts

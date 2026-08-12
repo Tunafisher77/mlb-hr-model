@@ -1,6 +1,6 @@
 # MLB Results Tracking
 
-This addition is deliberately downstream from the Game, HR, and Player Props models.
+This addition is deliberately downstream from the Game, HR, Player Props, and Best Card models.
 
 ## Non-interference boundary
 
@@ -18,6 +18,7 @@ This addition is deliberately downstream from the Game, HR, and Player Props mod
 - `Tracking - Game Picks`: the seven Game Picks published in the email, plus official results.
 - `Tracking - HR Picks`: the nine HR targets/watchlist players published in the email, plus official results.
 - `Tracking - Player Props`: the 20 published Player Props, milestones, and official boxscore results.
+- `Tracking - Best Card`: the three published same-game stacks, all four component results, and the complete 4-for-4 stack result.
 - `Tracking - Performance`: overall and segment-level accuracy/hit rate.
 - `Tracking - Run Log`: snapshot/grading status and counts.
 
@@ -38,6 +39,9 @@ optional `YYYY-MM-DD` snapshot date.
 - Final game winners are graded Yes/No.
 - HR targets are graded from the official game boxscore.
 - Hits, total bases, RBIs, and pitcher strikeouts are graded against their published dynamic thresholds.
+- Each Best Card row separately grades the game winner, HR, Prop 1, and Prop 2.
+- A Best Card is a successful complete stack only when all four components hit.
+- Best Card component accuracy and complete-stack accuracy are reported separately.
 - A player with no plate appearance is marked `DNP`, not a miss.
 - A strikeout target with no innings pitched is marked `DNP`, not a miss.
 - An unmatched player is marked `DNP/Unmatched`, not a miss, and retained for review.

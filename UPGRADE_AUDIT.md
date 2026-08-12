@@ -1,6 +1,6 @@
 # Production Audit and Upgrade Boundary
 
-Audit date: 2026-08-10
+Audit date: 2026-08-12
 
 ## Confirmed production architecture
 
@@ -40,3 +40,9 @@ The Game and HR Python scripts and their two workflows are frozen by SHA-256 in
 The new tracker is an independent module and workflow. It reads only published output,
 writes only new `Tracking - ...` tabs, and grades from official MLB game feeds. It uses
 the existing Google service-account secret and does not require Apps Script changes.
+
+## Added downstream models
+
+- Player Props V1.1.1 publishes statistics-only dynamic milestones for Hits, Total Bases, RBIs, and pitcher Strikeouts.
+- Best Card V1.1 publishes exactly three same-game statistical stacks and uses the full eligible Player Props pool only when the emailed top 20 cannot cover three games.
+- Best Card results tracking grades the winner, HR, both player props, and the complete 4-for-4 stack without changing any selection output.
