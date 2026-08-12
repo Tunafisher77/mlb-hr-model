@@ -138,23 +138,57 @@ def rows_as_records(values: list[list[str]]) -> list[dict[str, str]]:
     return records
 
 
+def quota_retry(operation, attempts: int = 5):
+    """Retry temporary Google Sheets per-minute quota responses."""
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except Exception as error:
+            message = str(error).lower()
+            is_quota = "429" in message or "quota exceeded" in message
+            if not is_quota or attempt + 1 >= attempts:
+                raise
+            time.sleep(15 * (attempt + 1))
+
+
+def worksheet_by_title(workbook, title: str):
+    """Reuse worksheet objects so gspread does not refetch sheet metadata."""
+    cache = getattr(workbook, "_tracking_worksheet_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(workbook, "_tracking_worksheet_cache", cache)
+    if title not in cache:
+        cache[title] = quota_retry(lambda: workbook.worksheet(title))
+    return cache[title]
+
+
 def get_or_create_sheet(workbook, title: str, headers: list[str], rows: int = 5000):
     try:
-        worksheet = workbook.worksheet(title)
+        worksheet = worksheet_by_title(workbook, title)
     except Exception as error:
         if error.__class__.__name__ != "WorksheetNotFound":
             raise
-        worksheet = workbook.add_worksheet(title=title, rows=rows, cols=len(headers))
+        worksheet = quota_retry(
+            lambda: workbook.add_worksheet(title=title, rows=rows, cols=len(headers))
+        )
+        workbook._tracking_worksheet_cache[title] = worksheet
         worksheet.update(values=[headers], range_name=f"A1:{column_letter(len(headers))}1")
         return worksheet
 
-    existing = worksheet.row_values(1)
+    verified = getattr(workbook, "_tracking_verified_headers", None)
+    if verified is None:
+        verified = set()
+        setattr(workbook, "_tracking_verified_headers", verified)
+    if title in verified:
+        return worksheet
+    existing = quota_retry(lambda: worksheet.row_values(1))
     if not existing:
         worksheet.update(values=[headers], range_name=f"A1:{column_letter(len(headers))}1")
     elif existing[: len(headers)] != headers:
         raise RuntimeError(
             f"Refusing to write {title}: existing header does not match the tracking schema."
         )
+    verified.add(title)
     return worksheet
 
 
@@ -167,7 +201,7 @@ def column_letter(number: int) -> str:
 
 
 def existing_prediction_ids(worksheet) -> set[str]:
-    values = worksheet.col_values(1)
+    values = quota_retry(lambda: worksheet.col_values(1))
     return {str(value).strip() for value in values[1:] if str(value).strip()}
 
 
@@ -186,7 +220,8 @@ def append_new_rows(worksheet, headers: list[str], records: Iterable[dict[str, A
 
 
 def summary_value(workbook, tab_name: str, label: str) -> str:
-    records = workbook.worksheet(tab_name).get_all_values()
+    worksheet = worksheet_by_title(workbook, tab_name)
+    records = quota_retry(worksheet.get_all_values)
     for row in records:
         if row and row[0] == label:
             return row[1] if len(row) > 1 else ""
@@ -250,8 +285,8 @@ def snapshot_game_picks(workbook, target_date: str) -> int:
         raise RuntimeError(
             f"Game Email Summary is not fresh for {target_date}; found {summary_date or 'missing'}."
         )
-    source = workbook.worksheet(GAME_SOURCE_TAB)
-    records = rows_as_records(source.get_all_values())
+    source = worksheet_by_title(workbook, GAME_SOURCE_TAB)
+    records = rows_as_records(quota_retry(source.get_all_values))
     candidates = []
     for record in records:
         rank = as_int(record.get("Rank"))
@@ -283,8 +318,8 @@ def snapshot_hr_picks(workbook, target_date: str) -> int:
         raise RuntimeError(
             f"Email Summary is not fresh for {target_date}; found {summary_date or 'missing'}."
         )
-    source = workbook.worksheet(HR_SOURCE_TAB)
-    records = rows_as_records(source.get_all_values())
+    source = worksheet_by_title(workbook, HR_SOURCE_TAB)
+    records = rows_as_records(quota_retry(source.get_all_values))
     candidates_by_id: dict[str, dict[str, Any]] = {}
     for record in records:
         rank = as_int(record.get("Rank"))
@@ -320,8 +355,8 @@ def snapshot_player_props(workbook, target_date: str) -> int:
             f"Player Props Email Summary is not fresh for {target_date}; "
             f"found {summary_date or 'missing'}."
         )
-    source = workbook.worksheet(PROP_SOURCE_TAB)
-    records = rows_as_records(source.get_all_values())
+    source = worksheet_by_title(workbook, PROP_SOURCE_TAB)
+    records = rows_as_records(quota_retry(source.get_all_values))
     candidates = []
     for record in records:
         report_rank = as_int(record.get("Report Rank"))
@@ -516,7 +551,7 @@ def cached_feed(feed_cache: dict[str, dict[str, Any]], game_pk: str) -> dict[str
 
 def grade_game_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
     worksheet = get_or_create_sheet(workbook, GAME_TRACKING_TAB, GAME_HEADERS)
-    values = worksheet.get_all_values()
+    values = quota_retry(worksheet.get_all_values)
     records = rows_as_records(values)
     graded = 0
     for offset, record in enumerate(records, start=2):
@@ -552,7 +587,7 @@ def grade_game_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
 
 def grade_hr_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
     worksheet = get_or_create_sheet(workbook, HR_TRACKING_TAB, HR_HEADERS)
-    values = worksheet.get_all_values()
+    values = quota_retry(worksheet.get_all_values)
     records = rows_as_records(values)
     graded = 0
     for offset, record in enumerate(records, start=2):
@@ -602,7 +637,7 @@ def grade_hr_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
 
 def grade_player_prop_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
     worksheet = get_or_create_sheet(workbook, PROP_TRACKING_TAB, PROP_HEADERS, rows=10000)
-    records = rows_as_records(worksheet.get_all_values())
+    records = rows_as_records(quota_retry(worksheet.get_all_values))
     graded = 0
     for offset, record in enumerate(records, start=2):
         if record.get("Result Status") not in {"", "Pending", "Error"}:
@@ -666,7 +701,8 @@ def performance_rows(workbook) -> list[list[Any]]:
         ("Player Props", PROP_TRACKING_TAB, "Hit Prop?", "Yes"),
     ]:
         try:
-            records = rows_as_records(workbook.worksheet(tab).get_all_values())
+            worksheet = worksheet_by_title(workbook, tab)
+            records = rows_as_records(quota_retry(worksheet.get_all_values))
         except Exception as error:
             if error.__class__.__name__ != "WorksheetNotFound":
                 raise

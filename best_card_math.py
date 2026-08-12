@@ -32,6 +32,7 @@ def select_distinct_props(
     ordered = sorted(
         props,
         key=lambda row: (
+            row.get("Prop Candidate Source") == "Published Player Prop",
             number(row.get("Prop Score")),
             number(row.get("Projected Probability")),
             -number(row.get("Report Rank"), 9999),

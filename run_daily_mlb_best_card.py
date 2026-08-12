@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from best_card_math import composite_stack_score, number, select_distinct_props, top_complete_stacks
 
 
-MODEL_VERSION = "Best Card V1.0.1 - Duplicate Header Score Fix"
+MODEL_VERSION = "Best Card V1.1 - Always Three Statistical Fallback"
 MODEL_TIMEZONE = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
 DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
@@ -22,6 +22,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapi
 GAME_SOURCE_TAB = "Game Picks"
 HR_SOURCE_TAB = "Model Results"
 PROP_SOURCE_TAB = "Player Props"
+PROP_HISTORY_TAB = "Player Props Model Results"
 BEST_CARD_TAB = "Best Card"
 BEST_CARD_HISTORY_TAB = "Best Card Model Results"
 BEST_CARD_EMAIL_TAB = "Best Card Email Summary"
@@ -129,6 +130,7 @@ def load_inputs(workbook):
     game_records = rows_as_records(workbook.worksheet(GAME_SOURCE_TAB).get_all_values())
     hr_records = rows_as_records(workbook.worksheet(HR_SOURCE_TAB).get_all_values())
     prop_records = rows_as_records(workbook.worksheet(PROP_SOURCE_TAB).get_all_values())
+    prop_history_records = rows_as_records(workbook.worksheet(PROP_HISTORY_TAB).get_all_values())
 
     games = []
     for row in game_records:
@@ -159,7 +161,7 @@ def load_inputs(workbook):
             hr_candidates.append(row)
 
     prop_version = clean_text(prop_summary.get("Model Version"))
-    props = []
+    props_by_id = {}
     for row in prop_records:
         report_rank = as_int(row.get("Report Rank"))
         if date_text(row.get("Date")) != TODAY.isoformat() or not 1 <= report_rank <= PUBLISHED_PROP_LIMIT:
@@ -170,8 +172,23 @@ def load_inputs(workbook):
             continue
         row = dict(row)
         row["GamePk"] = normalized_game_pk(row.get("GamePk"))
+        row["Prop Candidate Source"] = "Published Player Prop"
         if row["GamePk"] and row.get("Player") and row.get("Prop Type"):
-            props.append(row)
+            props_by_id[row.get("Prediction ID") or f"published-{len(props_by_id)}"] = row
+    for row in prop_history_records:
+        if date_text(row.get("Date")) != TODAY.isoformat():
+            continue
+        if prop_version and row.get("Model Version") != prop_version:
+            continue
+        if not verified(row.get("Roster Verified")) or not verified(row.get("Schedule Verified")):
+            continue
+        row = dict(row)
+        row["GamePk"] = normalized_game_pk(row.get("GamePk"))
+        row["Prop Candidate Source"] = "Extended Player Prop"
+        prediction_key = row.get("Prediction ID") or f"extended-{len(props_by_id)}"
+        if row["GamePk"] and row.get("Player") and row.get("Prop Type"):
+            props_by_id.setdefault(prediction_key, row)
+    props = list(props_by_id.values())
     return games, hr_candidates, props, game_summary, hr_summary, prop_summary
 
 
@@ -210,12 +227,14 @@ def build_stacks(games, hr_candidates, props):
         if not hr:
             reasons.append("No HR candidate in ranks 1-30")
         if len(selected_props) < 2:
-            reasons.append("Fewer than two distinct published props after excluding HR hitter")
+            reasons.append("Fewer than two distinct statistically eligible props after excluding HR hitter")
         complete = not reasons
         integrity.append({
             "Date": TODAY.isoformat(), "GamePk": game_pk, "Game": game.get("Game", ""),
             "Game Rank": as_int(game.get("Rank")), "Projected Winner": game.get("Projected Winner", ""),
-            "HR Candidates": len(hrs_by_game.get(game_pk, [])), "Published Props": len(props_by_game.get(game_pk, [])),
+            "HR Candidates": len(hrs_by_game.get(game_pk, [])),
+            "Published Props": sum(row.get("Prop Candidate Source") == "Published Player Prop" for row in props_by_game.get(game_pk, [])),
+            "Extended Props": sum(row.get("Prop Candidate Source") == "Extended Player Prop" for row in props_by_game.get(game_pk, [])),
             "Complete": "Yes" if complete else "No", "Notes": "Complete stack" if complete else "; ".join(reasons),
         })
         if not complete:
@@ -241,11 +260,20 @@ def build_stacks(games, hr_candidates, props):
             "Prop 2 Score": number(prop_two.get("Prop Score")), "Prop 2 Probability": number(prop_two.get("Projected Probability")),
             "Prop 2 Prediction ID": prop_two.get("Prediction ID", ""),
             "Stack Score": stack_score, "Complete": True,
-            "Selection Notes": "Same-game statistical synthesis; HR player excluded from both props.", "Result": "",
+            "Selection Notes": (
+                "Same-game statistical synthesis; HR player excluded from both props; "
+                f"Prop sources: {prop_one.get('Prop Candidate Source', '')}, {prop_two.get('Prop Candidate Source', '')}."
+            ),
+            "Prop 1 Candidate Source": prop_one.get("Prop Candidate Source", ""),
+            "Prop 2 Candidate Source": prop_two.get("Prop Candidate Source", ""),
+            "Result": "",
         })
     card = top_complete_stacks(stacks, count=3)
     if len(card) != 3:
-        raise RuntimeError(f"Statistical integrity gate produced {len(card)} complete stacks; exactly 3 required.")
+        raise RuntimeError(
+            f"Only {len(card)} stacks could be formed even after using all statistically eligible props; "
+            "three verified games with HR candidates are required."
+        )
     for rank, stack in enumerate(card, start=1):
         stack["Card Rank"] = rank
     return card, integrity
@@ -304,8 +332,8 @@ def build_email_rows(card):
         rows.extend([
             [f"Stack {stack['Card Rank']}", f"{stack['Projected Winner']} | {stack['Game']} | {stack['Venue']}"],
             ["Home Run", f"{stack['HR Player']} to hit a home run | {stack['HR Candidate Source']} | HR score {stack['HR Score']:.2f}"],
-            ["Player Prop 1", f"{stack['Prop 1 Pick']} | {stack['Prop 1 Probability']:.1f}%"],
-            ["Player Prop 2", f"{stack['Prop 2 Pick']} | {stack['Prop 2 Probability']:.1f}%"],
+            ["Player Prop 1", f"{stack['Prop 1 Pick']} | {stack['Prop 1 Probability']:.1f}% | {stack.get('Prop 1 Candidate Source', 'Published Player Prop')}"],
+            ["Player Prop 2", f"{stack['Prop 2 Pick']} | {stack['Prop 2 Probability']:.1f}% | {stack.get('Prop 2 Candidate Source', 'Published Player Prop')}"],
             ["Stack Score", f"{stack['Stack Score']:.2f}"],
             ["Game Model", f"{stack['Projected Winner']} win probability {stack['Win Probability']:.1f}% | Game rank {stack['Game Rank']}"],
             ["Integrity", "Same game confirmed | HR player distinct from both prop players | Two distinct prop players"], [],
@@ -314,7 +342,7 @@ def build_email_rows(card):
         ["Model Notes"],
         ["HR Expansion Rule", "Published HR ranks 1-9 are preferred; ranks 10-30 may be used only to complete three qualified games."],
         ["Data Constraint", "Statistics only. No sportsbook odds, lines, implied probability, or market influence."],
-        ["Failure Rule", "If three complete qualified stacks do not exist, the model fails instead of forcing a pick."],
+        ["Always Three Rule", "Published props are preferred; the full statistically eligible prop pool is used only as needed to complete three games."],
         ["Results Tracking", "Each component and complete stack will be archived and graded after games become final."],
     ])
     return rows
@@ -332,14 +360,20 @@ def write_outputs(workbook, card, integrity):
     append_unique(history_ws, HEADERS, card)
     email_rows = build_email_rows(card)
     email_ws.clear(); email_ws.update(values=email_rows, range_name=f"A1:B{len(email_rows)}")
-    integrity_headers = ["Date", "GamePk", "Game", "Game Rank", "Projected Winner", "HR Candidates", "Published Props", "Complete", "Notes"]
-    integrity_ws.clear(); integrity_ws.update(values=[integrity_headers] + [[row.get(header, "") for header in integrity_headers] for row in integrity], range_name=f"A1:I{len(integrity)+1}")
+    integrity_headers = ["Date", "GamePk", "Game", "Game Rank", "Projected Winner", "HR Candidates", "Published Props", "Extended Props", "Complete", "Notes"]
+    integrity_ws.clear(); integrity_ws.update(values=[integrity_headers] + [[row.get(header, "") for header in integrity_headers] for row in integrity], range_name=f"A1:J{len(integrity)+1}")
     extended_count = sum(row["HR Candidate Source"] == "Extended HR Candidate" for row in card)
+    extended_prop_count = sum(
+        row.get(source) == "Extended Player Prop"
+        for row in card
+        for source in ("Prop 1 Candidate Source", "Prop 2 Candidate Source")
+    )
     run_rows = [
         ["Run Timestamp UTC", RUN_UTC], ["Run Timestamp Pacific", RUN_LOCAL],
         ["Schedule Date Used", TODAY.isoformat()], ["Schedule Date Logic", DATE_LOGIC],
         ["Model Version", MODEL_VERSION], ["Complete Candidate Games", sum(row["Complete"] == "Yes" for row in integrity)],
         ["Published Stacks", len(card)], ["Extended HR Candidates Used", extended_count],
+        ["Extended Player Props Used", extended_prop_count],
         ["Status", "Completed Successfully"],
     ]
     run_ws.clear(); run_ws.update(values=run_rows, range_name=f"A1:B{len(run_rows)}")
