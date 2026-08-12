@@ -96,6 +96,14 @@ def sample_feed(final=True, home_runs=1, plate_appearances=4):
                                     "doubles": 1, "triples": 0, "homeRuns": home_runs,
                                     "rbi": 3,
                                 }},
+                            },
+                            "ID518692": {
+                                "person": {"id": 518692, "fullName": "Freddie Freeman"},
+                                "stats": {"batting": {
+                                    "plateAppearances": 4, "atBats": 4, "hits": 2,
+                                    "doubles": 0, "triples": 0, "homeRuns": 0,
+                                    "rbi": 1,
+                                }},
                             }
                         }
                     },
@@ -222,6 +230,49 @@ class ResultsTrackerUnitTest(unittest.TestCase):
         self.assertEqual(result["Result Status"], "Final")
         self.assertEqual(result["Actual Value"], 2)
         self.assertEqual(result["Hit Prop?"], "Yes")
+
+    def test_best_card_snapshot_and_component_grading(self):
+        best_card_headers = [
+            "Prediction ID", "Date", "Model Version", "Card Rank", "GamePk", "Game",
+            "Venue", "Projected Winner", "Win Probability", "HR Player", "HR Team",
+            "HR Rank", "HR Candidate Source", "Prop 1 Player", "Prop 1 Type",
+            "Prop 1 Threshold", "Prop 1 Pick", "Prop 1 Prediction ID", "Prop 2 Player",
+            "Prop 2 Type", "Prop 2 Threshold", "Prop 2 Pick", "Prop 2 Prediction ID",
+            "Stack Score",
+        ]
+        row = [
+            "best-card-1", "2026-08-10", "Best Card V1.1", "1", "823918",
+            "KC @ LAD", "Dodger Stadium", "LAD", "80.4", "Shohei Ohtani", "LAD",
+            "1", "Published HR Target", "Freddie Freeman", "Hits", "2",
+            "Freddie Freeman 2+ Hits", "prop-1", "Tarik Skubal", "Strikeouts", "7",
+            "Tarik Skubal 7+ Strikeouts", "prop-2", "77.2",
+        ]
+        row_two = list(row)
+        row_two[0], row_two[3] = "best-card-2", "2"
+        row_three = list(row)
+        row_three[0], row_three[3] = "best-card-3", "3"
+        workbook = FakeWorkbook({
+            "Best Card Email Summary": FakeWorksheet([
+                ["Model Version", "Best Card V1.1"],
+                ["Schedule Date Used", "2026-08-10"],
+            ]),
+            "Best Card": FakeWorksheet([best_card_headers, row, row_two, row_three]),
+        })
+        self.assertEqual(tracker.snapshot_best_card(workbook, "2026-08-10"), 3)
+        self.assertEqual(tracker.snapshot_best_card(workbook, "2026-08-10"), 0)
+
+        graded = tracker.grade_best_card_rows(workbook, {"823918": sample_feed()})
+        self.assertEqual(graded, 3)
+        result = tracker.rows_as_records(
+            workbook.sheets[tracker.BEST_CARD_TRACKING_TAB].get_all_values()
+        )[0]
+        self.assertEqual(result["Winner Correct?"], "Yes")
+        self.assertEqual(result["HR Hit?"], "Yes")
+        self.assertEqual(result["Prop 1 Hit?"], "Yes")
+        self.assertEqual(result["Prop 2 Hit?"], "Yes")
+        self.assertEqual(result["Components Graded"], 4)
+        self.assertEqual(result["Components Hit"], 4)
+        self.assertEqual(result["Perfect Stack?"], "Yes")
 
 
 if __name__ == "__main__":
