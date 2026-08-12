@@ -48,8 +48,10 @@ class FakeWorksheet:
 class FakeWorkbook:
     def __init__(self, sheets):
         self.sheets = sheets
+        self.worksheet_calls = 0
 
     def worksheet(self, title):
+        self.worksheet_calls += 1
         if title not in self.sheets:
             raise WorksheetNotFound(title)
         return self.sheets[title]
@@ -104,6 +106,27 @@ def sample_feed(final=True, home_runs=1, plate_appearances=4):
 
 
 class ResultsTrackerUnitTest(unittest.TestCase):
+    def test_worksheet_lookup_is_cached(self):
+        workbook = FakeWorkbook({"Example": FakeWorksheet([["A"]])})
+        first = tracker.worksheet_by_title(workbook, "Example")
+        second = tracker.worksheet_by_title(workbook, "Example")
+        self.assertIs(first, second)
+        self.assertEqual(workbook.worksheet_calls, 1)
+
+    def test_quota_retry_recovers_from_temporary_429(self):
+        calls = []
+
+        def operation():
+            calls.append(True)
+            if len(calls) < 3:
+                raise RuntimeError("APIError: [429] quota exceeded")
+            return "ok"
+
+        with patch.object(tracker.time, "sleep") as sleep:
+            self.assertEqual(tracker.quota_retry(operation), "ok")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_final_score(self):
         away, home, away_runs, home_runs, winner = tracker.final_score(sample_feed())
         self.assertEqual((away, home, away_runs, home_runs, winner), ("KC", "LAD", 2, 6, "LAD"))

@@ -19,6 +19,23 @@ class BestCardMathTest(unittest.TestCase):
         selected = select_distinct_props(props, hr)
         self.assertEqual([row["Player ID"] for row in selected], ["2", "3"])
 
+    def test_published_props_are_preferred_before_extended_fallbacks(self):
+        props = [
+            {"Player": "Extended A", "Prop Score": 95, "Prop Candidate Source": "Extended Player Prop"},
+            {"Player": "Published A", "Prop Score": 80, "Prop Candidate Source": "Published Player Prop"},
+            {"Player": "Published B", "Prop Score": 79, "Prop Candidate Source": "Published Player Prop"},
+        ]
+        selected = select_distinct_props(props, {"Player": "HR Player"})
+        self.assertEqual([row["Player"] for row in selected], ["Published A", "Published B"])
+
+    def test_extended_prop_completes_stack_when_only_one_published_prop_exists(self):
+        props = [
+            {"Player": "Published A", "Prop Score": 80, "Prop Candidate Source": "Published Player Prop"},
+            {"Player": "Extended A", "Prop Score": 78, "Prop Candidate Source": "Extended Player Prop"},
+        ]
+        selected = select_distinct_props(props, {"Player": "HR Player"})
+        self.assertEqual([row["Player"] for row in selected], ["Published A", "Extended A"])
+
     def test_only_complete_stacks_are_ranked(self):
         stacks = [
             {"GamePk": "1", "Complete": True, "Stack Score": 75, "Win Probability": 80, "HR Score": 70},
