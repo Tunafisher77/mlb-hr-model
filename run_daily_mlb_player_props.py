@@ -24,10 +24,11 @@ from player_props_math import (
     poisson_tail,
     prop_strength_score,
     select_limited_indices,
+    stats_splits,
 )
 
 
-MODEL_VERSION = "Player Props V1.1 - Cross-Category Dynamic Calibration"
+MODEL_VERSION = "Player Props V1.1.1 - Empty Stats Response Guard"
 MODEL_TIMEZONE = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
 DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
@@ -258,7 +259,7 @@ def fetch_hitter_stats(active_players):
         {"stats": "season", "group": "hitting", "playerPool": "ALL", "season": YEAR, "sportIds": 1, "limit": 2000},
     )
     rows = []
-    for split in payload.get("stats", [{}])[0].get("splits", []):
+    for split in stats_splits(payload):
         player = split.get("player", {}) or {}
         player_id = safe_int(player.get("id"))
         if player_id not in active_players: continue
@@ -283,7 +284,7 @@ def fetch_team_hitting():
         {"group": "hitting", "stats": "season", "season": YEAR, "sportIds": 1},
     )
     result = {}
-    for split in payload.get("stats", [{}])[0].get("splits", []):
+    for split in stats_splits(payload):
         team_id = safe_int((split.get("team", {}) or {}).get("id"))
         stat = split.get("stat", {}) or {}
         games = max(1, safe_int(stat.get("gamesPlayed"), 1))
@@ -300,7 +301,7 @@ def fetch_pitcher_stats(player_id):
         f"https://statsapi.mlb.com/api/v1/people/{int(player_id)}/stats",
         {"stats": "season", "group": "pitching", "season": YEAR},
     )
-    splits = payload.get("stats", [{}])[0].get("splits", [])
+    splits = stats_splits(payload)
     stat = splits[0].get("stat", {}) if splits else {}
     starts = safe_int(stat.get("gamesStarted"))
     innings = parse_baseball_innings(stat.get("inningsPitched"))

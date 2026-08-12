@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
+
+
+def stats_splits(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the first MLB stats block's splits, tolerating an empty response."""
+    stats = payload.get("stats") or []
+    if not stats or not isinstance(stats[0], dict):
+        return []
+    return stats[0].get("splits") or []
 
 
 def clamp(value: float, low: float, high: float) -> float:
