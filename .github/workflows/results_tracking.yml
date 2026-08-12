@@ -2,7 +2,7 @@ name: MLB Results Tracking
 
 on:
   schedule:
-    # Runs after both production models. The second run is an idempotent retry.
+    # Runs after all four published models. The second run is an idempotent retry.
     - cron: "15 13 * * *"
     - cron: "15 15 * * *"
   workflow_dispatch:
