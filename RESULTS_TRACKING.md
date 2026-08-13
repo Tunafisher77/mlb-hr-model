@@ -24,6 +24,8 @@ This addition is deliberately downstream from the Game, HR, Player Props, and Be
 
 Prediction fields are written once. Later runs update only result fields.
 Deterministic prediction IDs prevent duplicate rows when the tracker retries.
+Worksheet objects are cached, unchanged pending game statuses are not rewritten, and
+temporary Google Sheets read/write quota responses are retried with backoff.
 
 ## Schedule
 

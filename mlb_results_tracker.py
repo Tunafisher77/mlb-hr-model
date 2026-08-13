@@ -194,7 +194,11 @@ def get_or_create_sheet(workbook, title: str, headers: list[str], rows: int = 50
             lambda: workbook.add_worksheet(title=title, rows=rows, cols=len(headers))
         )
         workbook._tracking_worksheet_cache[title] = worksheet
-        worksheet.update(values=[headers], range_name=f"A1:{column_letter(len(headers))}1")
+        quota_retry(
+            lambda: worksheet.update(
+                values=[headers], range_name=f"A1:{column_letter(len(headers))}1"
+            )
+        )
         return worksheet
 
     verified = getattr(workbook, "_tracking_verified_headers", None)
@@ -205,7 +209,11 @@ def get_or_create_sheet(workbook, title: str, headers: list[str], rows: int = 50
         return worksheet
     existing = quota_retry(lambda: worksheet.row_values(1))
     if not existing:
-        worksheet.update(values=[headers], range_name=f"A1:{column_letter(len(headers))}1")
+        quota_retry(
+            lambda: worksheet.update(
+                values=[headers], range_name=f"A1:{column_letter(len(headers))}1"
+            )
+        )
     elif existing[: len(headers)] != headers:
         raise RuntimeError(
             f"Refusing to write {title}: existing header does not match the tracking schema."
@@ -237,7 +245,7 @@ def append_new_rows(worksheet, headers: list[str], records: Iterable[dict[str, A
         rows.append([clean(record.get(header, "")) for header in headers])
         existing.add(prediction_id)
     if rows:
-        worksheet.append_rows(rows, value_input_option="USER_ENTERED")
+        quota_retry(lambda: worksheet.append_rows(rows, value_input_option="USER_ENTERED"))
     return len(rows)
 
 
@@ -615,10 +623,24 @@ def update_result_fields(
         current[indices[header] - 1] = clean(value)
     first_column = min(indices[header] for header in updates)
     last_column = max(indices[header] for header in updates)
-    worksheet.update(
-        values=[current[first_column - 1:last_column]],
-        range_name=f"{column_letter(first_column)}{row_number}:{column_letter(last_column)}{row_number}",
+    quota_retry(
+        lambda: worksheet.update(
+            values=[current[first_column - 1:last_column]],
+            range_name=f"{column_letter(first_column)}{row_number}:{column_letter(last_column)}{row_number}",
+        )
     )
+
+
+def update_game_status_if_changed(
+    worksheet, headers: list[str], row_number: int, record: dict[str, Any], detailed: str
+) -> bool:
+    """Avoid consuming a write request when a pending game's status is unchanged."""
+    if str(record.get("Game Status", "")) == str(detailed):
+        return False
+    update_result_fields(
+        worksheet, headers, row_number, {"Game Status": detailed}, record
+    )
+    return True
 
 
 def cached_feed(feed_cache: dict[str, dict[str, Any]], game_pk: str) -> dict[str, Any]:
@@ -648,7 +670,7 @@ def grade_game_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
             graded += 1
             continue
         if not is_final(feed):
-            update_result_fields(worksheet, GAME_HEADERS, offset, {"Game Status": detailed}, record)
+            update_game_status_if_changed(worksheet, GAME_HEADERS, offset, record, detailed)
             continue
         away, home, away_runs, home_runs, winner = final_score(feed)
         projected = normalized_id_piece(record.get("Projected Winner", ""))
@@ -684,7 +706,7 @@ def grade_hr_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int:
             graded += 1
             continue
         if not is_final(feed):
-            update_result_fields(worksheet, HR_HEADERS, offset, {"Game Status": detailed}, record)
+            update_game_status_if_changed(worksheet, HR_HEADERS, offset, record, detailed)
             continue
         player = find_player_boxscore(feed, record.get("Player", ""), record.get("HomeAway", ""))
         if not player:
@@ -733,7 +755,7 @@ def grade_player_prop_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> i
             graded += 1
             continue
         if not is_final(feed):
-            update_result_fields(worksheet, PROP_HEADERS, offset, {"Game Status": detailed}, record)
+            update_game_status_if_changed(worksheet, PROP_HEADERS, offset, record, detailed)
             continue
         player = find_player_boxscore_by_id(feed, record.get("Player ID"), record.get("HomeAway", ""))
         if not player:
@@ -842,8 +864,8 @@ def grade_best_card_rows(workbook, feed_cache: dict[str, dict[str, Any]]) -> int
             graded += 1
             continue
         if not is_final(feed):
-            update_result_fields(
-                worksheet, BEST_CARD_HEADERS, offset, {"Game Status": detailed}, record
+            update_game_status_if_changed(
+                worksheet, BEST_CARD_HEADERS, offset, record, detailed
             )
             continue
 
@@ -983,14 +1005,19 @@ def refresh_performance(workbook):
     rows = performance_rows(workbook)
     headers = rows[0]
     worksheet = get_or_create_sheet(workbook, PERFORMANCE_TAB, headers, rows=500)
-    worksheet.clear()
-    worksheet.update(values=rows, range_name=f"A1:H{len(rows)}")
+    quota_retry(worksheet.clear)
+    quota_retry(lambda: worksheet.update(values=rows, range_name=f"A1:H{len(rows)}"))
 
 
 def append_run_log(workbook, mode: str, target_date: str, details: str, status: str):
     headers = ["Run Timestamp UTC", "Mode", "Target Date", "Status", "Details"]
     worksheet = get_or_create_sheet(workbook, RUN_LOG_TAB, headers, rows=2000)
-    worksheet.append_row([utc_now_text(), mode, target_date, status, details], value_input_option="USER_ENTERED")
+    quota_retry(
+        lambda: worksheet.append_row(
+            [utc_now_text(), mode, target_date, status, details],
+            value_input_option="USER_ENTERED",
+        )
+    )
 
 
 def run(mode: str, target_date: str) -> dict[str, int]:
