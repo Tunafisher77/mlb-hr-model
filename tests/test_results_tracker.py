@@ -12,6 +12,7 @@ class WorksheetNotFound(Exception):
 class FakeWorksheet:
     def __init__(self, values=None):
         self.values = [list(row) for row in (values or [])]
+        self.update_calls = 0
 
     def get_all_values(self):
         return [list(row) for row in self.values]
@@ -26,6 +27,7 @@ class FakeWorksheet:
         self.values.extend([list(row) for row in rows])
 
     def update(self, values, range_name=None):
+        self.update_calls += 1
         match = re.fullmatch(r"([A-Z]+)(\d+):([A-Z]+)(\d+)", range_name or "")
         if not match:
             return
@@ -134,6 +136,24 @@ class ResultsTrackerUnitTest(unittest.TestCase):
             self.assertEqual(tracker.quota_retry(operation), "ok")
         self.assertEqual(len(calls), 3)
         self.assertEqual(sleep.call_count, 2)
+
+    def test_unchanged_game_status_does_not_write(self):
+        worksheet = FakeWorksheet([tracker.GAME_HEADERS, [""] * len(tracker.GAME_HEADERS)])
+        record = {"Game Status": "Pre-Game"}
+        changed = tracker.update_game_status_if_changed(
+            worksheet, tracker.GAME_HEADERS, 2, record, "Pre-Game"
+        )
+        self.assertFalse(changed)
+        self.assertEqual(worksheet.update_calls, 0)
+
+    def test_changed_game_status_writes_once(self):
+        worksheet = FakeWorksheet([tracker.GAME_HEADERS, [""] * len(tracker.GAME_HEADERS)])
+        record = {"Game Status": "Scheduled"}
+        changed = tracker.update_game_status_if_changed(
+            worksheet, tracker.GAME_HEADERS, 2, record, "Pre-Game"
+        )
+        self.assertTrue(changed)
+        self.assertEqual(worksheet.update_calls, 1)
 
     def test_final_score(self):
         away, home, away_runs, home_runs, winner = tracker.final_score(sample_feed())
