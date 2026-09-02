@@ -3,7 +3,11 @@ name: Daily MLB Best Card
 on:
   schedule:
     # Runs after HR, Game, and Player Props models.
+    # Later entries are backups for delayed or dropped schedule events.
     - cron: "30 12 * * *"
+    - cron: "30 13 * * *"
+    - cron: "30 14 * * *"
+    - cron: "30 15 * * *"
   workflow_dispatch:
     inputs:
       best_card_date:
