@@ -206,8 +206,13 @@ def best_hr_for_game(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
     )[0]
 
 
-def prediction_id(game_pk: str) -> str:
-    return "|".join([TODAY.isoformat(), game_pk, re.sub(r"[^a-z0-9]+", "", MODEL_VERSION.lower())])
+def prediction_id(game_pk: str, hr: dict[str, Any] | None = None, props: list[dict[str, Any]] | None = None) -> str:
+    parts = [TODAY.isoformat(), game_pk, re.sub(r"[^a-z0-9]+", "", MODEL_VERSION.lower())]
+    if hr is not None:
+        parts.append(clean_text(hr.get("Player ID") or hr.get("Player")))
+    for prop in props or []:
+        parts.append(clean_text(prop.get("Prediction ID") or prop.get("Player")))
+    return "|".join(parts)
 
 
 def build_stacks(games, hr_candidates, props):
@@ -219,6 +224,40 @@ def build_stacks(games, hr_candidates, props):
         props_by_game[row["GamePk"]].append(row)
 
     stacks, integrity = [], []
+    primary_keys = set()
+
+    def make_stack(game, hr, selected_props, selection_mode):
+        game_pk = game["GamePk"]
+        prop_one, prop_two = selected_props
+        stack_score = composite_stack_score(
+            game.get("Win Probability"), hr.get("Score"), prop_one.get("Prop Score"), prop_two.get("Prop Score")
+        )
+        stack = {
+            "Prediction ID": prediction_id(game_pk, hr, selected_props), "Date": TODAY.isoformat(),
+            "Model Version": MODEL_VERSION, "GamePk": game_pk, "Game": game.get("Game", ""),
+            "Venue": game.get("Venue", ""), "Projected Winner": game.get("Projected Winner", ""),
+            "Game Rank": as_int(game.get("Rank")), "Win Probability": number(game.get("Win Probability")),
+            "Game Confidence": game.get("Confidence", ""), "HR Player": hr.get("Player", ""),
+            "HR Team": hr.get("Team", ""), "HR Rank": as_int(hr.get("Rank")),
+            "HR Score": number(hr.get("Score")), "HR Confidence": hr.get("Confidence", ""),
+            "HR Candidate Source": hr.get("HR Candidate Source", ""),
+            "Prop 1 Player": prop_one.get("Player", ""), "Prop 1 Type": prop_one.get("Prop Type", ""),
+            "Prop 1 Threshold": as_int(prop_one.get("Threshold")), "Prop 1 Pick": prop_one.get("Recommended Prop", ""),
+            "Prop 1 Score": number(prop_one.get("Prop Score")), "Prop 1 Probability": number(prop_one.get("Projected Probability")),
+            "Prop 1 Prediction ID": prop_one.get("Prediction ID", ""),
+            "Prop 2 Player": prop_two.get("Player", ""), "Prop 2 Type": prop_two.get("Prop Type", ""),
+            "Prop 2 Threshold": as_int(prop_two.get("Threshold")), "Prop 2 Pick": prop_two.get("Recommended Prop", ""),
+            "Prop 2 Score": number(prop_two.get("Prop Score")), "Prop 2 Probability": number(prop_two.get("Projected Probability")),
+            "Prop 2 Prediction ID": prop_two.get("Prediction ID", ""), "Stack Score": stack_score, "Complete": True,
+            "Selection Notes": (
+                f"{selection_mode}; same-game statistical synthesis; HR player excluded from both props; "
+                f"Prop sources: {prop_one.get('Prop Candidate Source', '')}, {prop_two.get('Prop Candidate Source', '')}."
+            ),
+            "Prop 1 Candidate Source": prop_one.get("Prop Candidate Source", ""),
+            "Prop 2 Candidate Source": prop_two.get("Prop Candidate Source", ""), "Result": "",
+        }
+        return stack
+
     for game in games:
         game_pk = game["GamePk"]
         hr = best_hr_for_game(hrs_by_game.get(game_pk, []))
@@ -237,42 +276,44 @@ def build_stacks(games, hr_candidates, props):
             "Extended Props": sum(row.get("Prop Candidate Source") == "Extended Player Prop" for row in props_by_game.get(game_pk, [])),
             "Complete": "Yes" if complete else "No", "Notes": "Complete stack" if complete else "; ".join(reasons),
         })
-        if not complete:
-            continue
-        prop_one, prop_two = selected_props
-        stack_score = composite_stack_score(
-            game.get("Win Probability"), hr.get("Score"), prop_one.get("Prop Score"), prop_two.get("Prop Score")
-        )
-        stacks.append({
-            "Prediction ID": prediction_id(game_pk), "Date": TODAY.isoformat(), "Model Version": MODEL_VERSION,
-            "GamePk": game_pk, "Game": game.get("Game", ""), "Venue": game.get("Venue", ""),
-            "Projected Winner": game.get("Projected Winner", ""), "Game Rank": as_int(game.get("Rank")),
-            "Win Probability": number(game.get("Win Probability")), "Game Confidence": game.get("Confidence", ""),
-            "HR Player": hr.get("Player", ""), "HR Team": hr.get("Team", ""), "HR Rank": as_int(hr.get("Rank")),
-            "HR Score": number(hr.get("Score")), "HR Confidence": hr.get("Confidence", ""),
-            "HR Candidate Source": hr.get("HR Candidate Source", ""),
-            "Prop 1 Player": prop_one.get("Player", ""), "Prop 1 Type": prop_one.get("Prop Type", ""),
-            "Prop 1 Threshold": as_int(prop_one.get("Threshold")), "Prop 1 Pick": prop_one.get("Recommended Prop", ""),
-            "Prop 1 Score": number(prop_one.get("Prop Score")), "Prop 1 Probability": number(prop_one.get("Projected Probability")),
-            "Prop 1 Prediction ID": prop_one.get("Prediction ID", ""),
-            "Prop 2 Player": prop_two.get("Player", ""), "Prop 2 Type": prop_two.get("Prop Type", ""),
-            "Prop 2 Threshold": as_int(prop_two.get("Threshold")), "Prop 2 Pick": prop_two.get("Recommended Prop", ""),
-            "Prop 2 Score": number(prop_two.get("Prop Score")), "Prop 2 Probability": number(prop_two.get("Projected Probability")),
-            "Prop 2 Prediction ID": prop_two.get("Prediction ID", ""),
-            "Stack Score": stack_score, "Complete": True,
-            "Selection Notes": (
-                "Same-game statistical synthesis; HR player excluded from both props; "
-                f"Prop sources: {prop_one.get('Prop Candidate Source', '')}, {prop_two.get('Prop Candidate Source', '')}."
-            ),
-            "Prop 1 Candidate Source": prop_one.get("Prop Candidate Source", ""),
-            "Prop 2 Candidate Source": prop_two.get("Prop Candidate Source", ""),
-            "Result": "",
-        })
+        if complete:
+            stack = make_stack(game, hr, selected_props, "Primary one-stack-per-game selection")
+            stacks.append(stack)
+            primary_keys.add(stack["Prediction ID"])
+
     card = top_complete_stacks(stacks, count=3)
+
+    # Emergency fallback: if the slate cannot supply three different complete games,
+    # rank alternate statistically complete combinations from verified games. This
+    # preserves all player/schedule gates and never invents a pick.
+    if len(card) < 3:
+        alternates = []
+        for game in games:
+            game_pk = game["GamePk"]
+            ordered_hrs = sorted(
+                hrs_by_game.get(game_pk, []),
+                key=lambda row: (
+                    row.get("HR Candidate Source") == "Published HR Target",
+                    number(row.get("Score")),
+                    -as_int(row.get("Rank"), 9999),
+                ),
+                reverse=True,
+            )
+            for hr in ordered_hrs:
+                eligible_props = select_distinct_props(props_by_game.get(game_pk, []), hr, count=6)
+                for first_index in range(len(eligible_props)):
+                    for second_index in range(first_index + 1, len(eligible_props)):
+                        selected = [eligible_props[first_index], eligible_props[second_index]]
+                        stack = make_stack(game, hr, selected, "Emergency alternate complete stack")
+                        if stack["Prediction ID"] not in primary_keys:
+                            alternates.append(stack)
+        ranked_alternates = top_complete_stacks(alternates, count=max(0, 3 - len(card)))
+        card.extend(ranked_alternates)
+
     if len(card) != 3:
         raise RuntimeError(
-            f"Only {len(card)} stacks could be formed even after using all statistically eligible props; "
-            "three verified games with HR candidates are required."
+            f"Only {len(card)} distinct complete stacks could be formed after the verified alternate-stack fallback; "
+            "three statistically complete combinations are required."
         )
     for rank, stack in enumerate(card, start=1):
         stack["Card Rank"] = rank
