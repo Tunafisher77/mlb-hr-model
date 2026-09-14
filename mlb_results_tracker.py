@@ -471,6 +471,23 @@ def snapshot_best_card(workbook, target_date: str) -> int:
     return append_new_rows(tracking, BEST_CARD_HEADERS, candidates)
 
 
+
+def snapshot_best_card_if_available(workbook, target_date: str) -> tuple[int, str]:
+    """Snapshot Best Card without blocking independent models when it is delayed."""
+    try:
+        return snapshot_best_card(workbook, target_date), ""
+    except RuntimeError as error:
+        message = str(error)
+        recoverable = (
+            "Best Card Email Summary is not fresh" in message
+            or "Best Card snapshot found" in message
+        )
+        if not recoverable:
+            raise
+        warning = f"Best Card snapshot deferred: {message}"
+        print(f"WARNING: {warning}")
+        return 0, warning
+
 def fetch_game_feed(game_pk: str, attempts: int = 3) -> dict[str, Any]:
     import requests
 
@@ -1033,7 +1050,11 @@ def run(mode: str, target_date: str) -> dict[str, int]:
             counts["game_snapshots"] = snapshot_game_picks(workbook, target_date)
             counts["hr_snapshots"] = snapshot_hr_picks(workbook, target_date)
             counts["prop_snapshots"] = snapshot_player_props(workbook, target_date)
-            counts["best_card_snapshots"] = snapshot_best_card(workbook, target_date)
+            counts["best_card_snapshots"], best_card_warning = snapshot_best_card_if_available(
+                workbook, target_date
+            )
+        else:
+            best_card_warning = ""
         if mode in {"grade", "both"}:
             cache: dict[str, dict[str, Any]] = {}
             counts["game_graded"] = grade_game_rows(workbook, cache)
@@ -1041,7 +1062,10 @@ def run(mode: str, target_date: str) -> dict[str, int]:
             counts["prop_graded"] = grade_player_prop_rows(workbook, cache)
             counts["best_card_graded"] = grade_best_card_rows(workbook, cache)
         refresh_performance(workbook)
-        append_run_log(workbook, mode, target_date, json.dumps(counts, sort_keys=True), "Completed")
+        details = json.dumps(counts, sort_keys=True)
+        if best_card_warning:
+            details += f" | {best_card_warning}"
+        append_run_log(workbook, mode, target_date, details, "Completed with warning" if best_card_warning else "Completed")
         return counts
     except Exception as error:
         append_run_log(workbook, mode, target_date, str(error), "Failed")
