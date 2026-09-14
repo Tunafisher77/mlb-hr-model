@@ -1,7 +1,7 @@
 import unittest
 
 from best_card_math import composite_stack_score, select_distinct_props, top_complete_stacks
-from run_daily_mlb_best_card import rows_as_records
+from run_daily_mlb_best_card import build_stacks, rows_as_records
 
 
 class BestCardMathTest(unittest.TestCase):
@@ -50,6 +50,33 @@ class BestCardMathTest(unittest.TestCase):
             ["Junior Caminero", "72.76", ""],
         ]
         self.assertEqual(rows_as_records(values)[0]["Score"], "72.76")
+
+
+    def test_thin_slate_uses_distinct_complete_alternate_stack(self):
+        games = [
+            {"GamePk": "1", "Game": "A @ B", "Rank": "1", "Win Probability": "75", "Projected Winner": "B"},
+            {"GamePk": "2", "Game": "C @ D", "Rank": "2", "Win Probability": "72", "Projected Winner": "D"},
+        ]
+        hrs = [
+            {"GamePk": "1", "Player": "HR A", "Player ID": "10", "Rank": "1", "Score": "80", "HR Candidate Source": "Published HR Target"},
+            {"GamePk": "1", "Player": "HR B", "Player ID": "11", "Rank": "4", "Score": "74", "HR Candidate Source": "Published HR Target"},
+            {"GamePk": "2", "Player": "HR C", "Player ID": "20", "Rank": "2", "Score": "78", "HR Candidate Source": "Published HR Target"},
+        ]
+        props = []
+        for game_pk, offset in (("1", 100), ("2", 200)):
+            for index, score in enumerate((82, 79, 76), start=1):
+                props.append({
+                    "GamePk": game_pk, "Player": f"Prop {game_pk}-{index}",
+                    "Player ID": str(offset + index), "Prediction ID": f"p-{game_pk}-{index}",
+                    "Prop Type": "Hits", "Prop Score": score, "Projected Probability": score,
+                    "Prop Candidate Source": "Published Player Prop",
+                })
+
+        card, _ = build_stacks(games, hrs, props)
+
+        self.assertEqual(len(card), 3)
+        self.assertEqual(len({row["Prediction ID"] for row in card}), 3)
+        self.assertTrue(any("Emergency alternate" in row["Selection Notes"] for row in card))
 
 
 if __name__ == "__main__":
