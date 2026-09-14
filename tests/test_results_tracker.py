@@ -251,6 +251,20 @@ class ResultsTrackerUnitTest(unittest.TestCase):
         self.assertEqual(result["Actual Value"], 2)
         self.assertEqual(result["Hit Prop?"], "Yes")
 
+    def test_delayed_best_card_does_not_block_other_tracking(self):
+        workbook = FakeWorkbook({
+            "Best Card Email Summary": FakeWorksheet([
+                ["Model Version", "Best Card V1.1"],
+                ["Schedule Date Used", "2026-08-09"],
+            ]),
+        })
+
+        count, warning = tracker.snapshot_best_card_if_available(workbook, "2026-08-10")
+
+        self.assertEqual(count, 0)
+        self.assertIn("snapshot deferred", warning)
+        self.assertIn("not fresh", warning)
+
     def test_best_card_snapshot_and_component_grading(self):
         best_card_headers = [
             "Prediction ID", "Date", "Model Version", "Card Rank", "GamePk", "Game",
