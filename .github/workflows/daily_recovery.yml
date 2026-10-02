@@ -215,6 +215,7 @@ jobs:
           PY
 
       - name: Archive and grade published picks
+        if: steps.freshness.outputs.no_games != 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python mlb_results_tracker.py --mode both
