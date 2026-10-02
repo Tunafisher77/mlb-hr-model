@@ -32,20 +32,40 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
+      - name: Check for MLB games today
+        id: mlb_slate
+        run: |
+          python - <<'PY'
+          import json, os
+          from datetime import datetime
+          from urllib.request import urlopen
+          from zoneinfo import ZoneInfo
+          day = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+          with urlopen(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={day}", timeout=15) as r:
+              data = json.load(r)
+          count = sum(len(d.get("games", [])) for d in data.get("dates", []))
+          print(f"Official MLB games for {day}: {count}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"has_games={'true' if count else 'false'}\n")
+          PY
       - name: Setup Python
+        if: steps.mlb_slate.outputs.has_games == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install Dependencies
+        if: steps.mlb_slate.outputs.has_games == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Verify frozen production models
+        if: steps.mlb_slate.outputs.has_games == 'true'
         run: python -m unittest discover -s tests -v
 
       - name: Archive and grade published picks
+        if: steps.mlb_slate.outputs.has_games == 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           TRACKER_MODE: ${{ inputs.mode || 'both' }}
