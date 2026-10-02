@@ -25,18 +25,20 @@ jobs:
 
       - name: Check for MLB games today
         id: mlb_slate
-        shell: bash
         run: |
-          game_count=$(curl --fail --silent --show-error --retry 2 \
-            "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=$(TZ=America/New_York date +%F)" \
-            | python -c 'import json,sys; d=json.load(sys.stdin); print(sum(len(x.get("games", [])) for x in d.get("dates", [])))')
-          echo "Official MLB games today: ${game_count}"
-          if [ "${game_count}" -eq 0 ]; then
-            echo "has_games=false" >> "$GITHUB_OUTPUT"
-            echo "MLB off-day confirmed; best card exits successfully."
-          else
-            echo "has_games=true" >> "$GITHUB_OUTPUT"
-          fi
+          python - <<'PY'
+          import json, os
+          from datetime import datetime
+          from urllib.request import urlopen
+          from zoneinfo import ZoneInfo
+          day = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+          with urlopen(f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={day}", timeout=15) as r:
+              data = json.load(r)
+          count = sum(len(d.get("games", [])) for d in data.get("dates", []))
+          print(f"Official MLB games for {day}: {count}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"has_games={'true' if count else 'false'}\n")
+          PY
       - name: Setup Python
         if: steps.mlb_slate.outputs.has_games == 'true'
         uses: actions/setup-python@v5
