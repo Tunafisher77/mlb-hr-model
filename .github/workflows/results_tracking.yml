@@ -1,6 +1,11 @@
 name: MLB Results Tracking
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/results_tracking.yml"
   schedule:
     # Grade yesterday early; later runs retry and snapshot today's picks.
     - cron: "15 7 * * *"
