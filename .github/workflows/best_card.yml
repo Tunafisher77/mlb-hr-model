@@ -23,17 +23,34 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
 
+      - name: Check for MLB games today
+        id: mlb_slate
+        shell: bash
+        run: |
+          game_count=$(curl --fail --silent --show-error --retry 2 \
+            "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=$(TZ=America/New_York date +%F)" \
+            | python -c 'import json,sys; d=json.load(sys.stdin); print(sum(len(x.get("games", [])) for x in d.get("dates", [])))')
+          echo "Official MLB games today: ${game_count}"
+          if [ "${game_count}" -eq 0 ]; then
+            echo "has_games=false" >> "$GITHUB_OUTPUT"
+            echo "MLB off-day confirmed; best card exits successfully."
+          else
+            echo "has_games=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Setup Python
+        if: steps.mlb_slate.outputs.has_games == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install Dependencies
+        if: steps.mlb_slate.outputs.has_games == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements_best_card.txt
 
       - name: Skip delayed backup when today's card is already current
+        if: steps.mlb_slate.outputs.has_games == 'true'
         id: freshness
         if: github.event_name == 'schedule'
         env:
