@@ -126,7 +126,7 @@ jobs:
           PY
 
       - name: Verify production safeguards
-        if: steps.freshness.outputs.current != 'true' && steps.freshness.outputs.no_games != 'true'
+        if: steps.freshness.outputs.no_games == 'false' && steps.freshness.outputs.current != 'true'
         run: python -m unittest discover -s tests -v
 
       - name: Refresh stale MLB slate sequentially with retries
