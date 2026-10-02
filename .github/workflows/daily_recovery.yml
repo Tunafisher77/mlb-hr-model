@@ -52,6 +52,7 @@ jobs:
           import json
           import os
           from datetime import datetime, timedelta
+          from urllib.request import urlopen
           from zoneinfo import ZoneInfo
 
           import gspread
@@ -60,6 +61,27 @@ jobs:
           now = datetime.now(ZoneInfo("America/New_York"))
           expected = now.date() + timedelta(days=1) if now.hour >= 18 else now.date()
           expected_text = expected.isoformat()
+
+          # A scheduled off-day is healthy. Check the official MLB schedule before
+          # treating stale summary tabs as a recovery failure. If the schedule API
+          # is unavailable, fail open to the normal recovery path rather than
+          # incorrectly suppressing a real slate.
+          no_games = False
+          try:
+              schedule_url = (
+                  "https://statsapi.mlb.com/api/v1/schedule"
+                  f"?sportId=1&date={expected_text}"
+              )
+              with urlopen(schedule_url, timeout=15) as response:
+                  schedule = json.load(response)
+              game_count = sum(
+                  len(day.get("games", [])) for day in schedule.get("dates", [])
+              )
+              no_games = game_count == 0
+              print(f"Official MLB games for {expected_text}: {game_count}")
+          except Exception as exc:
+              print(f"MLB schedule check unavailable; continuing recovery checks: {exc}")
+
           credentials = Credentials.from_service_account_info(
               json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
               scopes=[
@@ -91,14 +113,15 @@ jobs:
           print(f"All model sheets current: {current}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"current={'true' if current else 'false'}\n")
+              output.write(f"no_games={'true' if no_games else 'false'}\n")
           PY
 
       - name: Verify production safeguards
-        if: steps.freshness.outputs.current != 'true'
+        if: steps.freshness.outputs.current != 'true' && steps.freshness.outputs.no_games != 'true'
         run: python -m unittest discover -s tests -v
 
       - name: Refresh stale MLB slate sequentially with retries
-        if: steps.freshness.outputs.current != 'true'
+        if: steps.freshness.outputs.current != 'true' && steps.freshness.outputs.no_games != 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         shell: bash
@@ -140,7 +163,7 @@ jobs:
           fi
 
       - name: Verify all four refreshed summaries
-        if: steps.freshness.outputs.current != 'true'
+        if: steps.freshness.outputs.current != 'true' && steps.freshness.outputs.no_games != 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
