@@ -52,9 +52,8 @@ jobs:
           pip install -r requirements_best_card.txt
 
       - name: Skip delayed backup when today's card is already current
-        if: steps.mlb_slate.outputs.has_games == 'true'
         id: freshness
-        if: github.event_name == 'schedule'
+        if: steps.mlb_slate.outputs.has_games == 'true' && github.event_name == 'schedule'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
