@@ -82,6 +82,15 @@ jobs:
           except Exception as exc:
               print(f"MLB schedule check unavailable; continuing recovery checks: {exc}")
 
+          # On a confirmed MLB off-day, exit before touching Google Sheets.
+          # This makes the guard a clean successful no-op and prevents stale-sheet
+          # checks or credential/API issues from generating false failure alerts.
+          if no_games:
+              print(f"MLB off-day confirmed for {expected_text}; recovery guard exiting successfully.")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("current=true\\n")
+                  output.write("no_games=true\\n")
+              raise SystemExit(0)
           credentials = Credentials.from_service_account_info(
               json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
               scopes=[
