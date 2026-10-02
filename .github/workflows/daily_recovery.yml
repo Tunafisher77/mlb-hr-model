@@ -88,8 +88,8 @@ jobs:
           if no_games:
               print(f"MLB off-day confirmed for {expected_text}; recovery guard exiting successfully.")
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                  output.write("current=true\\n")
-                  output.write("no_games=true\\n")
+                  output.write("current=true\n")
+                  output.write("no_games=true\n")
               raise SystemExit(0)
           credentials = Credentials.from_service_account_info(
               json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
@@ -130,7 +130,7 @@ jobs:
         run: python -m unittest discover -s tests -v
 
       - name: Refresh stale MLB slate sequentially with retries
-        if: steps.freshness.outputs.current != 'true' && steps.freshness.outputs.no_games != 'true'
+        if: steps.freshness.outputs.no_games == 'false' && steps.freshness.outputs.current != 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         shell: bash
@@ -172,7 +172,7 @@ jobs:
           fi
 
       - name: Verify all four refreshed summaries
-        if: steps.freshness.outputs.current != 'true' && steps.freshness.outputs.no_games != 'true'
+        if: steps.freshness.outputs.no_games == 'false' && steps.freshness.outputs.current != 'true'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
@@ -224,7 +224,7 @@ jobs:
           PY
 
       - name: Archive and grade published picks
-        if: steps.freshness.outputs.no_games != 'true'
+        if: steps.freshness.outputs.no_games == 'false'
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python mlb_results_tracker.py --mode both
