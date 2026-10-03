@@ -47,11 +47,17 @@ jobs:
         if: steps.slate.outputs.has_games == 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements_best_card.txt
+          pip install -r requirements_player_props.txt -r requirements_best_card.txt
 
       - name: Verify production safeguards
         if: steps.slate.outputs.has_games == 'true'
         run: python -m unittest discover -s tests -v
+
+      - name: Refresh Player Props data for Best Card
+        if: steps.slate.outputs.has_games == 'true'
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python run_daily_mlb_player_props.py
 
       - name: Run Best Card Model
         if: steps.slate.outputs.has_games == 'true'
