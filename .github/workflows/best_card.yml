@@ -1,4 +1,5 @@
 name: Daily MLB Best Card
+# Manual Best Card trigger: 2026-10-03 after frozen checksum synchronization
 
 on:
   schedule:
