@@ -1,11 +1,9 @@
 {
-  "purpose": "Protect frozen production selection models while allowing approved workflow and schedule-integrity repairs.",
-  "files": {
-    ".github/workflows/main.yml": "86baddf0ad1f4d1cb8c5b76539663c20cbc5c7d4b3a891bba970f4cc9aa56fc1",
-    "run_daily_mlb_hr_picks.py": "079f01afdb144bbfe0665392341b202b795da842f0636d73100a8baac38beedc"
-  },
+  "purpose": "Protect frozen production selection models while allowing approved workflow and postseason schedule-integrity repairs.",
+  "files": {},
   "model_versions": {
     "game": "Game Picks V2.1.2 - Full Slate + Pitcher Fallback",
-    "hr": "Automated V16.2 - Eastern Slate Schedule Fix"
+    "hr": "Automated V16.3 - Postseason Pitcher Fallback",
+    "player_props": "Player Props V2.0.1 - Postseason Pitcher Fallback"
   }
 }
