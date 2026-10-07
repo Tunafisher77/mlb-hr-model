@@ -116,10 +116,50 @@ jobs:
                   if row and row[0]
               }
               found[tab] = summary.get("Schedule Date Used", "")
-          current = all(value == expected_text for value in found.values())
+          dates_current = all(value == expected_text for value in found.values())
+
+          def records(tab):
+              values = workbook.worksheet(tab).get_all_values()
+              if not values:
+                  return []
+              headers = values[0]
+              return [
+                  {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+                  for row in values[1:] if any(str(cell).strip() for cell in row)
+              ]
+
+          game_rows = records("Game Picks")
+          hr_rows = records("Model Results")
+          prop_rows = records("Player Props")
+
+          def game_pks(rows, date_field="Date"):
+              result = set()
+              for row in rows:
+                  if str(row.get(date_field, ""))[:10] != expected_text:
+                      continue
+                  raw = str(row.get("GamePk", "")).strip()
+                  if raw:
+                      result.add(raw)
+              return result
+
+          game_coverage = game_pks(game_rows)
+          hr_coverage = game_pks(hr_rows)
+          prop_coverage = game_pks(prop_rows)
+          required_stack_games = min(3, game_count)
+          coverage_current = (
+              len(game_coverage) == game_count
+              and len(hr_coverage) >= required_stack_games
+              and len(prop_coverage) >= required_stack_games
+          )
+          current = dates_current and coverage_current
           print(f"Expected slate: {expected_text}")
           print(f"Summary dates: {found}")
-          print(f"All model sheets current: {current}")
+          print(
+              f"Coverage: games={len(game_coverage)}/{game_count}, "
+              f"HR games={len(hr_coverage)}, prop games={len(prop_coverage)}, "
+              f"required stack games={required_stack_games}"
+          )
+          print(f"All model sheets complete and current: {current}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"current={'true' if current else 'false'}\n")
               output.write(f"no_games={'true' if no_games else 'false'}\n")
@@ -215,12 +255,55 @@ jobs:
               actual = summary.get("Schedule Date Used", "")
               if actual != expected_text:
                   stale[tab] = actual or "missing"
-          if stale:
+
+          def records(tab):
+              values = workbook.worksheet(tab).get_all_values()
+              if not values:
+                  return []
+              headers = values[0]
+              return [
+                  {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+                  for row in values[1:] if any(str(cell).strip() for cell in row)
+              ]
+
+          def pks(tab):
+              result = set()
+              for row in records(tab):
+                  if str(row.get("Date", ""))[:10] != expected_text:
+                      continue
+                  raw = str(row.get("GamePk", "")).strip()
+                  if raw:
+                      result.add(raw)
+              return result
+
+          with urlopen(
+              "https://statsapi.mlb.com/api/v1/schedule"
+              f"?sportId=1&date={expected_text}",
+              timeout=15,
+          ) as response:
+              schedule = json.load(response)
+          official_count = sum(len(day.get("games", [])) for day in schedule.get("dates", []))
+          required_stack_games = min(3, official_count)
+          coverage = {
+              "Game Picks": len(pks("Game Picks")),
+              "HR": len(pks("Model Results")),
+              "Player Props": len(pks("Player Props")),
+          }
+          incomplete = (
+              coverage["Game Picks"] != official_count
+              or coverage["HR"] < required_stack_games
+              or coverage["Player Props"] < required_stack_games
+          )
+          if stale or incomplete:
               raise SystemExit(
-                  f"Refresh commands completed but summaries are not current. "
-                  f"Expected {expected_text}; stale={stale}"
+                  f"Refresh completed but slate validation failed. Expected {expected_text}; "
+                  f"stale={stale}; official_games={official_count}; coverage={coverage}; "
+                  f"required_stack_games={required_stack_games}"
               )
-          print(f"Verified all four summaries for {expected_text}.")
+          print(
+              f"Verified all four summaries and source coverage for {expected_text}: "
+              f"official_games={official_count}, coverage={coverage}."
+          )
           PY
 
       - name: Archive and grade published picks
