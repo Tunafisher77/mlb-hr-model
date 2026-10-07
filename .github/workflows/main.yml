@@ -1,4 +1,5 @@
 name: Daily MLB HR Picks
+# Approved one-time postseason HR recovery trigger.
 
 on:
   push:
