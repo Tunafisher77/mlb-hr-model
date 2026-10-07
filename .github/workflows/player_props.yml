@@ -1,6 +1,10 @@
 name: Daily MLB Player Props
 
 on:
+  push:
+    paths:
+      - '.github/workflows/player_props.yml'
+      - 'FROZEN_MODEL_BASELINE.json'
   schedule:
     # Run after HR and Game, with predawn backups for delayed schedules.
     - cron: "7 8 * * *"
