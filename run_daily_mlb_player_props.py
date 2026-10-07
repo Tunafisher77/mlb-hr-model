@@ -220,7 +220,6 @@ def fetch_schedule():
         if not game.get("gamePk"): reasons.append("Missing gamePk")
         if not is_playable(status): reasons.append(f"Non-playable status: {status}")
         if not away_team.get("id") or not home_team.get("id"): reasons.append("Missing team identity")
-        if not away_pitcher.get("id") or not home_pitcher.get("id"): reasons.append("Missing probable pitcher")
         if not venue: reasons.append("Missing venue")
         if away_team.get("id") and team_game_counts[int(away_team["id"])] > 1: reasons.append("Doubleheader requires game-specific lineup")
         if home_team.get("id") and team_game_counts[int(home_team["id"])] > 1: reasons.append("Doubleheader requires game-specific lineup")
@@ -231,8 +230,8 @@ def fetch_schedule():
             "Status": status, "Venue": venue, "ParkFactor": PARK_FACTORS.get(venue, 100),
             "AwayTeamID": away_team.get("id", ""), "AwayTeam": team_abbrev(away_team),
             "HomeTeamID": home_team.get("id", ""), "HomeTeam": team_abbrev(home_team),
-            "AwayPitcherID": away_pitcher.get("id", ""), "AwayPitcher": away_pitcher.get("fullName", "Unknown"),
-            "HomePitcherID": home_pitcher.get("id", ""), "HomePitcher": home_pitcher.get("fullName", "Unknown"),
+            "AwayPitcherID": away_pitcher.get("id", ""), "AwayPitcher": away_pitcher.get("fullName", "TBD (neutral fallback)"),
+            "HomePitcherID": home_pitcher.get("id", ""), "HomePitcher": home_pitcher.get("fullName", "TBD (neutral fallback)"),
             "Verified": not reasons, "VerificationNotes": "Verified" if not reasons else "; ".join(reasons),
             **weather,
         }
@@ -298,6 +297,8 @@ def fetch_team_hitting():
 
 
 def fetch_pitcher_stats(player_id):
+    if not player_id:
+        return {"ERA": 4.50, "WHIP": 1.30, "K9": 8.0, "H9": 8.5, "HR9": 1.15, "Starts": 0, "IPPerStart": 0.0}
     payload = request_json(
         f"https://statsapi.mlb.com/api/v1/people/{int(player_id)}/stats",
         {"stats": "season", "group": "pitching", "season": YEAR},
@@ -437,9 +438,11 @@ def build_model():
     props = []
     for game in games:
         for pitcher_id in (game["AwayPitcherID"], game["HomePitcherID"]):
-            pitcher_cache[int(pitcher_id)] = fetch_pitcher_stats(pitcher_id)
-        away_pitcher = pitcher_cache[int(game["AwayPitcherID"])]
-        home_pitcher = pitcher_cache[int(game["HomePitcherID"])]
+            key = str(pitcher_id or "TBD")
+            if key not in pitcher_cache:
+                pitcher_cache[key] = fetch_pitcher_stats(pitcher_id)
+        away_pitcher = pitcher_cache[str(game["AwayPitcherID"] or "TBD")]
+        home_pitcher = pitcher_cache[str(game["HomePitcherID"] or "TBD")]
         for hitter in sorted(hitters_by_team[game["AwayTeamID"]], key=lambda row: row["PA"] / row["Games"], reverse=True)[:9]:
             props.extend(hitter_props(hitter, game, home_pitcher, team_stats, "Away"))
         for hitter in sorted(hitters_by_team[game["HomeTeamID"]], key=lambda row: row["PA"] / row["Games"], reverse=True)[:9]:
