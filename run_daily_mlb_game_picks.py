@@ -14,6 +14,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 MODEL_VERSION = "Game Picks V2.1.2 - Full Slate + Pitcher Fallback"
+# Postseason slates remain scoreable when MLB leaves a probable pitcher TBD.
 MLB_SCHEDULE_TZ = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
 MLB_SCHEDULE_DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
 
