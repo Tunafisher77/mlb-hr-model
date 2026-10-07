@@ -13,7 +13,7 @@ except Exception:
 import gspread
 from google.oauth2.service_account import Credentials
 
-MODEL_VERSION = "Game Picks V2.1.2 - Full Slate + Pitcher Fallback"
+MODEL_VERSION = "Game Picks V2.1.3 - Full Slate + Environment Fallback"
 # Postseason slates remain scoreable when MLB leaves a probable pitcher TBD.
 MLB_SCHEDULE_TZ = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
 MLB_SCHEDULE_DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
@@ -410,8 +410,11 @@ def verification_failure_reason(game_record):
     # the daily slate. MLB often leaves postseason/opening-pitcher fields TBD until
     # later in the day. get_pitcher_stats(None) already supplies the model's neutral
     # pitcher baseline, so keep the game and make the fallback explicit in the logs.
-    if not game_record.get("WeatherSourceStatus") or str(game_record.get("WeatherSourceStatus", "")).startswith("Missing"):
-        reasons.append("Weather not tied to verified venue")
+    # Weather is an environmental adjustment, not schedule identity. An official
+    # MLB game with verified gamePk/teams/venue must remain in the slate even when
+    # a new/renamed venue is missing from the local weather-coordinate table.
+    # get_weather_for_verified_venue() supplies a neutral fallback and records the
+    # condition in WeatherSourceStatus for auditability.
     return "; ".join(reasons)
 
 
