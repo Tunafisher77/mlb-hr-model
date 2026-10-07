@@ -146,8 +146,11 @@ jobs:
           hr_coverage = game_pks(hr_rows)
           prop_coverage = game_pks(prop_rows)
           required_stack_games = min(3, game_count)
+          # Game Picks intentionally excludes official games that are no longer
+          # pregame-playable (for example a game already in progress when a late
+          # recovery runs). The card requirement remains three unique games.
           coverage_current = (
-              len(game_coverage) == game_count
+              len(game_coverage) >= required_stack_games
               and len(hr_coverage) >= required_stack_games
               and len(prop_coverage) >= required_stack_games
           )
@@ -291,7 +294,7 @@ jobs:
               "Player Props": len(pks("Player Props")),
           }
           incomplete = (
-              coverage["Game Picks"] != official_count
+              coverage["Game Picks"] < required_stack_games
               or coverage["HR"] < required_stack_games
               or coverage["Player Props"] < required_stack_games
           )
