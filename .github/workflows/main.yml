@@ -1,6 +1,9 @@
 name: Daily MLB HR Picks
 
 on:
+  push:
+    paths:
+      - 'run_daily_mlb_hr_picks.py'
   schedule:
     # Start early because GitHub scheduled jobs have recently started hours late.
     # During daylight time, 07:30 UTC is 00:30 Pacific.
