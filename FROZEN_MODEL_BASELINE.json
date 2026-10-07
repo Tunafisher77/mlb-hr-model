@@ -1,7 +1,6 @@
 {
-  "purpose": "Protect frozen production selection files while allowing approved schedule-integrity repairs to the MLB game model.",
+  "purpose": "Protect frozen production selection models while allowing approved workflow and schedule-integrity repairs.",
   "files": {
-    ".github/workflows/game_picks.yml": "cc00fc10c5ba0ff5865bb93399dce7559bd1ca43cb418e00ed1dd0cd411d88c1",
     ".github/workflows/main.yml": "86baddf0ad1f4d1cb8c5b76539663c20cbc5c7d4b3a891bba970f4cc9aa56fc1",
     "run_daily_mlb_hr_picks.py": "079f01afdb144bbfe0665392341b202b795da842f0636d73100a8baac38beedc"
   },
