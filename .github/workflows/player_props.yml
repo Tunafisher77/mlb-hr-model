@@ -1,4 +1,5 @@
 name: Daily MLB Player Props
+# Recovery trigger enabled for approved production repairs.
 
 on:
   push:
