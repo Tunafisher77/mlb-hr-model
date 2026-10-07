@@ -6,6 +6,7 @@ on:
     paths:
       - '.github/workflows/player_props.yml'
       - 'FROZEN_MODEL_BASELINE.json'
+      - 'run_daily_mlb_player_props.py'
   schedule:
     # Run after HR and Game, with predawn backups for delayed schedules.
     - cron: "7 8 * * *"
