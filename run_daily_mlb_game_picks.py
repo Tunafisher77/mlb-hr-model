@@ -13,7 +13,7 @@ except Exception:
 import gspread
 from google.oauth2.service_account import Credentials
 
-MODEL_VERSION = "Game Picks V2.1.1 - Schedule Integrity Fix + Eastern Slate Date"
+MODEL_VERSION = "Game Picks V2.1.2 - Full Slate + Pitcher Fallback"
 MLB_SCHEDULE_TZ = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
 MLB_SCHEDULE_DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
 
@@ -405,10 +405,10 @@ def verification_failure_reason(game_record):
     status = game_record.get("GameStatus")
     if not is_playable_game_status(status):
         reasons.append(f"Non-playable status: {status or 'Unknown'}")
-    if not game_record.get("AwayPitcherID") or game_record.get("AwayPitcher") in [None, "", "Unknown"]:
-        reasons.append("Missing away probable pitcher")
-    if not game_record.get("HomePitcherID") or game_record.get("HomePitcher") in [None, "", "Unknown"]:
-        reasons.append("Missing home probable pitcher")
+    # A missing probable pitcher must not remove an otherwise official game from
+    # the daily slate. MLB often leaves postseason/opening-pitcher fields TBD until
+    # later in the day. get_pitcher_stats(None) already supplies the model's neutral
+    # pitcher baseline, so keep the game and make the fallback explicit in the logs.
     if not game_record.get("WeatherSourceStatus") or str(game_record.get("WeatherSourceStatus", "")).startswith("Missing"):
         reasons.append("Weather not tied to verified venue")
     return "; ".join(reasons)
@@ -487,9 +487,9 @@ def build_schedule_games():
                 "HomeTeam": team_abbrev(home_team),
                 "HomeTeamName": home_team.get("name", ""),
                 "HomeTeamID": home_team.get("id"),
-                "AwayPitcher": away_p.get("fullName", "Unknown"),
+                "AwayPitcher": away_p.get("fullName") or "TBD (neutral fallback)",
                 "AwayPitcherID": away_p.get("id"),
-                "HomePitcher": home_p.get("fullName", "Unknown"),
+                "HomePitcher": home_p.get("fullName") or "TBD (neutral fallback)",
                 "HomePitcherID": home_p.get("id"),
                 **weather,
             }
