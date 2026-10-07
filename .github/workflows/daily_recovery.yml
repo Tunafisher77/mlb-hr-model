@@ -220,6 +220,7 @@ jobs:
           import json
           import os
           from datetime import datetime, timedelta
+          from urllib.request import urlopen
           from zoneinfo import ZoneInfo
 
           import gspread
