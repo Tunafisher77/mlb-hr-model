@@ -1,7 +1,10 @@
 name: Daily MLB Best Card
-# Manual Best Card trigger: 2026-10-03 after frozen checksum synchronization
+# Recovery trigger: refreshed after Player Props recovery on 2026-10-07
 
 on:
+  push:
+    paths:
+      - '.github/workflows/best_card.yml'
   schedule:
     # Run after the three source models; retain later backups.
     - cron: "30 8 * * *"
