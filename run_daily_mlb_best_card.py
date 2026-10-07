@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from best_card_math import composite_stack_score, number, select_distinct_props, top_complete_stacks
 
 
-MODEL_VERSION = "Best Card V1.2 - Historical Hit-Rate Ranking"
+MODEL_VERSION = "Best Card V1.2.1 - Historical Hit-Rate Ranking + Unique Games"
 MODEL_TIMEZONE = os.environ.get("MLB_SCHEDULE_TZ", "America/New_York")
 DATE_OVERRIDE = os.environ.get("MLB_SCHEDULE_DATE", "").strip()
 SHEET_NAME = os.environ.get("SHEET_NAME", "MLB Daily Model")
@@ -344,9 +344,18 @@ def build_stacks(games, hr_candidates, props):
                         )
                         if stack["Prediction ID"] not in primary_keys:
                             alternates.append(stack)
-        card.extend(
-            top_complete_stacks(alternates, count=max(0, 3 - len(card)))
-        )
+        used_game_pks = {stack["GamePk"] for stack in card}
+        ranked_alternates = top_complete_stacks(alternates, count=len(alternates))
+        for alternate in ranked_alternates:
+            if alternate["GamePk"] in used_game_pks:
+                continue
+            card.append(alternate)
+            used_game_pks.add(alternate["GamePk"])
+            if len(card) == 3:
+                break
+
+    if len({stack["GamePk"] for stack in card}) != len(card):
+        raise RuntimeError("Best Card contains duplicate games; three unique games are required.")
 
     if len(card) != 3:
         raise RuntimeError(
