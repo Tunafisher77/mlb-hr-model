@@ -23,7 +23,7 @@ RUN_TIMESTAMP_LOCAL = RUN_NOW_LOCAL.strftime("%Y-%m-%d %H:%M:%S %Z")
 RUN_TIMESTAMP_EASTERN = RUN_NOW_EASTERN.strftime("%Y-%m-%d %H:%M:%S %Z")
 SCHEDULE_DATE_LOGIC = "Official MLB slate date from America/New_York"
 
-MODEL_VERSION = "Automated V16.2 - Eastern Slate Schedule Fix"
+MODEL_VERSION = "Automated V16.3 - Postseason Pitcher Fallback"
 SHEET_NAME = os.environ.get("SHEET_NAME", "Daily MLB HR Picks Scorecard")
 SHEET_ID = os.environ.get("SHEET_ID", "1SsjWyqMsEW9yghahhuHCjDDtqlW2-56SbUWwmMXdig8")
 
@@ -531,13 +531,12 @@ def build_model():
 
             if away_id:
                 todays_team_ids.append(away_id)
-                verified = bool(game_pk and away_id and home_id and venue and playable_status and home_p_id and weather_tied)
+                verified = bool(game_pk and away_id and home_id and venue and playable_status and weather_tied)
                 notes = []
                 if not game_pk: notes.append("missing gamePk")
                 if not home_id: notes.append("missing opponent team id")
                 if not venue: notes.append("missing venue")
                 if not playable_status: notes.append(f"unplayable game status: {status}")
-                if not home_p_id: notes.append("missing opposing probable pitcher")
                 if not weather_tied: notes.append(weather.get("WeatherStatus", "weather not tied to venue"))
                 matchups.append({
                     "Team ID": int(away_id),
@@ -557,13 +556,12 @@ def build_model():
 
             if home_id:
                 todays_team_ids.append(home_id)
-                verified = bool(game_pk and home_id and away_id and venue and playable_status and away_p_id and weather_tied)
+                verified = bool(game_pk and home_id and away_id and venue and playable_status and weather_tied)
                 notes = []
                 if not game_pk: notes.append("missing gamePk")
                 if not away_id: notes.append("missing opponent team id")
                 if not venue: notes.append("missing venue")
                 if not playable_status: notes.append(f"unplayable game status: {status}")
-                if not away_p_id: notes.append("missing opposing probable pitcher")
                 if not weather_tied: notes.append(weather.get("WeatherStatus", "weather not tied to venue"))
                 matchups.append({
                     "Team ID": int(home_id),
@@ -682,12 +680,13 @@ def build_model():
         model = model.drop(columns=["Team_game"])
 
     model = model.merge(pdf, on="Opposing Pitcher ID", how="left")
+    for col, fallback in [("ERA", 4.50), ("WHIP", 1.30), ("K9", 8.0), ("PitcherVulnerability", 50.0)]:
+        model[col] = pd.to_numeric(model[col], errors="coerce").fillna(fallback)
 
     model["PitcherKnown"] = model["Opposing Pitcher ID"].apply(lambda x: bool(str(x).strip()) and str(x).strip().lower() not in ["nan", "none", ""])
     model["RosterTeamVerified"] = model.apply(lambda r: int(r["Team ID"]) in verified_team_ids and str(r.get("RosterStatus", "")) == "Active", axis=1)
     model["HardVerified"] = (
         (model["MatchupVerified"] == True) &
-        (model["PitcherKnown"] == True) &
         (model["RosterTeamVerified"] == True) &
         (model["GamePk"].astype(str).str.len() > 0) &
         (model["Venue"].astype(str).str.len() > 0) &
@@ -1536,7 +1535,7 @@ def refresh_hr_targets(sh, card):
     for _, r in card.sort_values("Rank").iterrows():
         rows.append([
             TODAY.isoformat(), int(r.get("Rank",0)), r.get("Tier",""), r.get("ConfidenceLabel",""),
-            r.get("Player",""), r.get("Team",""), r.get("Opponent",""), r.get("Opposing Pitcher",""),
+            r.get("Player",""), r.get("Team",""), r.get("Opponent",""), r.get("Opposing Pitcher","") or "TBD (neutral fallback)",
             r.get("Venue",""), r.get("VerificationNotes",""), round(float(r.get("Score",0)),2), int(r.get("Season HR",0)), int(r.get("Last7HR",0)),
             round(float(r.get("HardHit%",0)),2), round(float(r.get("100+MPH%",0)),2), round(float(r.get("FlyBall%",0)),2),
             round(float(r.get("PitcherVulnerability",0)),2), int(float(r.get("ParkFactor",100))),
