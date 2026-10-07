@@ -354,12 +354,13 @@ def build_stacks(games, hr_candidates, props):
             if len(card) == 3:
                 break
 
+    target_count = min(3, len({game["GamePk"] for game in games}))
     if len({stack["GamePk"] for stack in card}) != len(card):
-        raise RuntimeError("Best Card contains duplicate games; three unique games are required.")
+        raise RuntimeError("Best Card contains duplicate games; each published stack must use a unique game.")
 
-    if len(card) != 3:
+    if len(card) != target_count:
         raise RuntimeError(
-            f"Only {len(card)} complete stacks could be formed; exactly three are required."
+            f"Only {len(card)} unique complete stacks could be formed; {target_count} are required for this slate."
         )
 
     for rank, stack in enumerate(card, start=1):
