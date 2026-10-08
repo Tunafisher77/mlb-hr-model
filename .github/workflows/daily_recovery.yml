@@ -19,6 +19,9 @@ on:
     - cron: "27 14 * * *"
     - cron: "31 15 * * *"
   workflow_dispatch:
+  workflow_run:
+    workflows: ["Daily MLB Player Props"]
+    types: [completed]
 
 concurrency:
   group: mlb-daily-recovery
@@ -26,6 +29,7 @@ concurrency:
 
 jobs:
   refresh-current-slate:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
